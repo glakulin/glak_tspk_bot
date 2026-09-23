@@ -1,0 +1,6 @@
+flask
+pyTelegramBotAPI
+requests
+pandas
+cachetools
+beautifulsoup4
