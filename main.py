@@ -17,7 +17,25 @@ if not BOT_TOKEN:
 
 print(f"=== BOOT === Токен загружен, длина: {len(BOT_TOKEN)}, начало: {BOT_TOKEN[:10]}...", flush=True)
 
+import socket
+import urllib.request
+
+try:
+    ip = socket.gethostbyname('api.telegram.org')
+    print(f"=== BOOT === api.telegram.org resolves to {ip}", flush=True)
+except Exception as e:
+    print(f"=== BOOT ERROR === DNS resolve failed: {e}", flush=True)
+
+try:
+    req = urllib.request.Request('https://api.telegram.org', method='HEAD')
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        print(f"=== BOOT === api.telegram.org reachable, status={resp.status}", flush=True)
+except Exception as e:
+    print(f"=== BOOT ERROR === api.telegram.org unreachable: {e}", flush=True)
+
 bot = telebot.TeleBot(BOT_TOKEN)
+telebot.apihelper.CONNECT_TIMEOUT = 5
+telebot.apihelper.READ_TIMEOUT = 5
 app = Flask(__name__)
 
 # Проверим, какой бот привязан к токену
