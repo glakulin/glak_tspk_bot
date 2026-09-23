@@ -16,7 +16,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения.")
 
-print(f"=== BOOT === Токен загружен, длина: {len(BOT_TOKEN)}", flush=True)
+print("=== BOOT === Токен загружен", flush=True)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 telebot.apihelper.CONNECT_TIMEOUT = 5
@@ -27,22 +27,59 @@ app = Flask(__name__)
 SCHEDULE_PAGE_URL = 'http://www.tspk.org/studentam_sl/raspisanie-na-kazhdyj-den.html'
 
 schedule_cache = TTLCache(maxsize=30, ttl=1800)
-links_cache = TTLCache(maxsize=1, ttl=600)  # 10 минут
+links_cache = TTLCache(maxsize=1, ttl=600)
 
 DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
 
+# Корни названий месяцев (в нижнем регистре) → номер месяца
+MONTHS_RU = [
+    ('январ', 1), ('феврал', 2), ('март', 3), ('апрел', 4),
+    ('май', 5), ('мая', 5), ('июн', 6), ('июл', 7), ('август', 8),
+    ('сентябр', 9), ('октябр', 10), ('ноябр', 11), ('декабр', 12),
+]
 
-# --- ПАРСИНГ СТРАНИЦЫ СО ССЫЛКАМИ ---
+
+# --- ИЗВЛЕЧЕНИЕ ДАТ ИЗ HTML ---
+
+def find_all_month_years(text):
+    """Найти все пары (год, месяц) в тексте."""
+    result = set()
+    t = text.lower()
+    for prefix, num in MONTHS_RU:
+        for m in re.finditer(prefix, t):
+            start = m.start()
+            year_match = re.search(r'\b(20\d{2})\b', t[start:start + 60])
+            if year_match:
+                result.add((int(year_match.group(1)), num))
+    return result
+
+
+def extract_date_from_ancestors(a_tag, day):
+    """Поднимаемся от ссылки вверх до ближайшего предка, где есть ровно один месяц+год."""
+    current = a_tag
+    for _ in range(25):
+        current = current.parent
+        if current is None:
+            break
+        text = current.get_text(' ', strip=True)
+        pairs = find_all_month_years(text)
+        if len(pairs) == 1:
+            year, month = next(iter(pairs))
+            try:
+                return dt.date(year, month, day)
+            except ValueError:
+                return None
+    return None
+
 
 def extract_sheet_links():
-    """Возвращает список: [{'sheet_id', 'anchor', 'context', 'date', 'building'}, ...]."""
+    """Собираем все ссылки на Google Sheets с их датами (если удалось определить)."""
     if 'links' in links_cache:
         return links_cache['links']
 
     r = requests.get(SCHEDULE_PAGE_URL, timeout=15)
     r.raise_for_status()
-    # Сайт старый — может отдавать windows-1251, но requests должен сам угадать
-    if r.encoding is None or r.encoding.lower() == 'iso-8859-1':
+    if not r.encoding or r.encoding.lower() in ('iso-8859-1', 'ascii'):
         r.encoding = 'utf-8'
 
     soup = BeautifulSoup(r.text, 'html.parser')
@@ -55,74 +92,51 @@ def extract_sheet_links():
             continue
 
         sheet_id = m.group(1)
-        anchor = a.get_text(' ', strip=True)
+        anchor = a.get_text(' ', strip=True).strip()
 
-        # Собираем контекст: текст ссылки + текст родителя + текст ближайших предков
-        ctx_parts = [anchor]
-        node = a
-        for _ in range(4):
-            node = node.parent
-            if node is None:
-                break
-            if node.name in ('td', 'th', 'li', 'p', 'div', 'h1', 'h2', 'h3', 'h4', 'tr'):
-                ctx_parts.append(node.get_text(' ', strip=True))
-                if node.name in ('td', 'th', 'li', 'h1', 'h2', 'h3', 'h4'):
-                    break
+        date_obj = None
 
-        context = ' '.join(ctx_parts)
-
-        # Ищем дату ДД.ММ.ГГГГ в контексте
-        date_str = None
-        dm = re.search(r'(\d{2})[.\-/](\d{2})[.\-/](\d{4})', context)
+        # Случай 1: в тексте ссылки явная дата дд.мм.гггг
+        dm = re.search(r'(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})', anchor)
         if dm:
-            date_str = f"{dm.group(1)}.{dm.group(2)}.{dm.group(3)}"
+            d, mo, y = int(dm.group(1)), int(dm.group(2)), int(dm.group(3))
+            if y < 100:
+                y += 2000
+            try:
+                date_obj = dt.date(y, mo, d)
+            except ValueError:
+                pass
 
-        # Ищем упоминание корпуса
-        bm = re.search(r'(\d)\s*корпус', context, re.IGNORECASE)
-        building = bm.group(1) if bm else None
+        # Случай 2: якорь — просто число 1..31
+        if date_obj is None and anchor.isdigit():
+            d = int(anchor)
+            if 1 <= d <= 31:
+                date_obj = extract_date_from_ancestors(a, d)
 
         links.append({
             'sheet_id': sheet_id,
             'anchor': anchor,
-            'context': context[:250],
-            'date': date_str,
-            'building': building,
+            'date': date_obj,
         })
 
-    print(f"=== extract_sheet_links === найдено {len(links)} ссылок", flush=True)
-    for i, l in enumerate(links[:30]):
-        print(f"  [{i}] date={l['date']} bld={l['building']} anchor='{l['anchor'][:70]}'", flush=True)
-
     links_cache['links'] = links
+    with_date = sum(1 for l in links if l['date'])
+    print(f"=== extract_sheet_links === total={len(links)}, with_date={with_date}", flush=True)
     return links
 
 
 def find_sheets_for_date(target_date):
-    """target_date: datetime.date → список ссылок на эту дату."""
+    """Возвращает (список_ссылок_на_дату, фактическая_дата)."""
     links = extract_sheet_links()
-    date_str = target_date.strftime('%d.%m.%Y')
-
-    matching = [l for l in links if l['date'] == date_str]
+    matching = [l for l in links if l['date'] == target_date]
     if matching:
         return matching, target_date
 
     # Fallback: ближайшая будущая дата
-    candidates = []
-    for l in links:
-        if not l['date']:
-            continue
-        try:
-            d = dt.datetime.strptime(l['date'], '%d.%m.%Y').date()
-        except ValueError:
-            continue
-        if d >= target_date:
-            candidates.append((d, l))
-
-    if candidates:
-        candidates.sort(key=lambda x: x[0])
-        nearest = candidates[0][0]
-        print(f"=== find_sheets_for_date === fallback на {nearest}", flush=True)
-        return [l for d, l in candidates if d == nearest], nearest
+    future = [l for l in links if l['date'] and l['date'] >= target_date]
+    if future:
+        nearest = min(l['date'] for l in future)
+        return [l for l in future if l['date'] == nearest], nearest
 
     return [], target_date
 
@@ -130,10 +144,6 @@ def find_sheets_for_date(target_date):
 # --- ПАРСИНГ CSV ---
 
 def parse_schedule_csv(text):
-    """
-    Возвращает (date_header, blocks).
-    block = {'groups': [...], 'building': None, 'rows': [{'pair','time','cells':{group: text}}]}
-    """
     reader = csv.reader(StringIO(text))
     rows = list(reader)
 
@@ -148,37 +158,29 @@ def parse_schedule_csv(text):
         first = row[0].strip()
         second = row[1].strip().lower() if len(row) > 1 else ''
 
-        # Заголовок блока «Пара, Время, группы...»
         if first.lower() == 'пара' and second == 'время':
             groups = [c.strip() for c in row[2:]]
             while groups and not groups[-1]:
                 groups.pop()
-            current = {'groups': groups, 'building': None, 'rows': []}
+            current = {'groups': groups, 'rows': []}
             blocks.append(current)
             continue
 
-        # Первая строка файла с датой
         if date_header is None and first.lower().startswith('расписание'):
             date_header = first.split(',')[0].strip()
             continue
 
-        # Строка с номером пары
         if current is not None and first.isdigit():
             time_slot = row[1].strip() if len(row) > 1 else ''
             cells = {}
             for i, g in enumerate(current['groups']):
                 cells[g] = row[i + 2].strip() if i + 2 < len(row) else ''
-            current['rows'].append({
-                'pair': first,
-                'time': time_slot,
-                'cells': cells,
-            })
+            current['rows'].append({'pair': first, 'time': time_slot, 'cells': cells})
 
     return date_header, blocks
 
 
 def get_schedule_for_date(target_date):
-    """Возвращает (date_header, blocks). Кэширует по дате."""
     key = target_date.strftime('%Y-%m-%d')
     if key in schedule_cache:
         return schedule_cache[key]
@@ -199,12 +201,11 @@ def get_schedule_for_date(target_date):
             dh, blocks = parse_schedule_csv(r.text)
             if dh and not date_header:
                 date_header = dh
-            for b in blocks:
-                b['building'] = sheet.get('building')
             all_blocks.extend(blocks)
-            print(f"=== get_schedule_for_date === {sheet['sheet_id'][:12]}... → блоков {len(blocks)}", flush=True)
+            print(f"=== get_schedule_for_date === {sheet['sheet_id'][:12]}… ({sheet['date']}) → блоков {len(blocks)}", flush=True)
         except Exception as e:
             print(f"=== get_schedule_for_date ERROR === {sheet['sheet_id'][:12]}: {e}", flush=True)
+            traceback.print_exc()
 
     schedule_cache[key] = (date_header, all_blocks)
     return date_header, all_blocks
@@ -218,6 +219,8 @@ def normalize(s):
 
 def find_group(blocks, query):
     q = normalize(query)
+    if not q:
+        return []
     matches = []
     for bi, block in enumerate(blocks):
         for g in block['groups']:
@@ -227,7 +230,7 @@ def find_group(blocks, query):
         return matches
     for bi, block in enumerate(blocks):
         for g in block['groups']:
-            if q and q in normalize(g):
+            if q in normalize(g):
                 matches.append((bi, g))
     return matches
 
@@ -259,8 +262,7 @@ def format_day_for_group(date_header, blocks, group_query):
 
         if block_lines:
             has_content = True
-            bld = f" · корпус {block['building']}" if block.get('building') else ""
-            lines.append(f"👥 Группа {g.strip()}{bld}")
+            lines.append(f"👥 Группа {g.strip()}")
             lines.extend(block_lines)
 
     if not has_content:
@@ -361,8 +363,7 @@ def start_message(msg):
     bot.send_message(
         msg.chat.id,
         "👋 Привет! Я бот расписания ТСПК.\n\n"
-        "Напиши название своей группы (например, СД-21), "
-        "и я покажу кнопки для быстрого доступа.",
+        "Напиши название своей группы (например, СД-21).",
         timeout=10,
     )
 
@@ -389,7 +390,7 @@ def handle_callback(call):
     data = call.data or ''
 
     if data == 'change_group':
-        bot.send_message(chat_id, "Напиши название своей группы (например, СД-21):", timeout=10)
+        bot.send_message(chat_id, "Напиши название своей группы:", timeout=10)
         return
 
     if '|' not in data:
@@ -415,13 +416,25 @@ def index():
 
 @app.route('/debug', methods=['GET'])
 def debug_links():
-    """Диагностика: показывает, какие ссылки нашлись на странице."""
+    """Показать, какие даты бот смог извлечь из страницы."""
     links = extract_sheet_links()
+
+    by_date = {}
+    for l in links:
+        if l['date']:
+            key = l['date'].strftime('%Y-%m-%d')
+        else:
+            key = 'unknown'
+        by_date.setdefault(key, []).append(l['anchor'][:40])
+
+    dates_sorted = sorted([k for k in by_date if k != 'unknown'])
+    if 'unknown' in by_date:
+        dates_sorted.append('unknown')
+
     return jsonify({
-        'count': len(links),
-        'links': [{'date': l['date'], 'building': l['building'],
-                   'anchor': l['anchor'][:120], 'context': l['context'][:200]}
-                  for l in links],
+        'total_links': len(links),
+        'with_date': sum(1 for l in links if l['date']),
+        'by_date': {k: by_date[k] for k in dates_sorted},
     })
 
 
