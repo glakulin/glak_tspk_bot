@@ -77,10 +77,9 @@ def extract_sheet_links():
 
     r = requests.get(SCHEDULE_PAGE_URL, timeout=15)
     r.raise_for_status()
-    if not r.encoding or r.encoding.lower() in ('iso-8859-1', 'ascii'):
-        r.encoding = 'utf-8'
+    html = r.content.decode('utf-8', errors='replace')
 
-    soup = BeautifulSoup(r.text, 'html.parser')
+    soup = BeautifulSoup(html, 'html.parser')
     pattern = re.compile(r'docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_-]+)')
 
     links = []
@@ -117,8 +116,7 @@ def extract_sheet_links():
 
 def get_available_dates():
     links = extract_sheet_links()
-    dates = sorted(set(l['date'] for l in links if l['date']))
-    return dates
+    return sorted(set(l['date'] for l in links if l['date']))
 
 
 def find_sheets_for_date(target_date):
@@ -141,6 +139,26 @@ def find_sheets_for_date(target_date):
     return [], target_date
 
 
+# --- ОЧИСТКА НАЗВАНИЙ ГРУПП ---
+
+def clean_group_name(g):
+    """
+    Оставляет только название группы в начале строки:
+    буквы + (дефис или пробел)? + цифры.
+    Всё, что идёт после — отбрасывается.
+    'ИСиП-41 2 смена' → 'ИСиП-41'
+    'НК-21 (1 смена)' → 'НК-21'
+    'Д-41 ' → 'Д-41'
+    """
+    if not g:
+        return g
+    g = g.strip()
+    m = re.match(r'^([А-Яа-яЁёA-Za-z]+[-\s]?\d+)', g)
+    if m:
+        return m.group(1).strip()
+    return g
+
+
 # --- ПАРСИНГ CSV ---
 
 def parse_schedule_csv(text):
@@ -159,9 +177,10 @@ def parse_schedule_csv(text):
         second = row[1].strip().lower() if len(row) > 1 else ''
 
         if first.lower() == 'пара' and second == 'время':
-            groups = [c.strip() for c in row[2:]]
-            while groups and not groups[-1]:
-                groups.pop()
+            raw_groups = [c.strip() for c in row[2:]]
+            while raw_groups and not raw_groups[-1]:
+                raw_groups.pop()
+            groups = [clean_group_name(g) for g in raw_groups]
             current = {'groups': groups, 'rows': []}
             blocks.append(current)
             continue
@@ -181,12 +200,15 @@ def parse_schedule_csv(text):
 
 
 def _download_and_parse(sheet):
-    """Скачивает один CSV и возвращает (date_header, blocks, error, raw_head)."""
+    """
+    Скачивает CSV и парсит. Читает как UTF-8 (Google отдаёт CSV без charset
+    в заголовке, из-за чего requests по умолчанию использует ISO-8859-1).
+    """
     url = f'https://docs.google.com/spreadsheets/d/{sheet["sheet_id"]}/export?format=csv'
     try:
         r = requests.get(url, timeout=15)
         r.raise_for_status()
-        text = r.text
+        text = r.content.decode('utf-8', errors='replace')
         dh, blocks = parse_schedule_csv(text)
         return dh, blocks, None, text[:300]
     except Exception as e:
@@ -194,11 +216,6 @@ def _download_and_parse(sheet):
 
 
 def get_schedule_for_date(target_date):
-    """
-    Возвращает (date_header, all_blocks, actual_date).
-    Пустые результаты НЕ кэшируются — иначе один неудачный запрос
-    блокирует день на 30 минут.
-    """
     key = target_date.strftime('%Y-%m-%d')
     if key in schedule_cache:
         cached = schedule_cache[key]
@@ -223,11 +240,10 @@ def get_schedule_for_date(target_date):
         if dh and not date_header:
             date_header = dh
         all_blocks.extend(blocks)
-        print(f"=== get_schedule_for_date === sheet {sheet['sheet_id'][:12]}… ({sheet['date']}) → блоков {len(blocks)}, head='{(raw_head or '')[:80]}'", flush=True)
+        print(f"=== get_schedule_for_date === sheet {sheet['sheet_id'][:12]}… ({sheet['date']}) → блоков {len(blocks)}", flush=True)
 
     result = (date_header, all_blocks, actual_date)
 
-    # Кэшируем только успешный результат
     if all_blocks:
         schedule_cache[key] = result
     else:
@@ -260,7 +276,7 @@ def find_group(blocks, query):
     partial = []
     for bi, block in enumerate(blocks):
         for g in block['groups']:
-            if q in normalize(g):
+            if q and q in normalize(g):
                 partial.append((bi, g))
     return partial
 
@@ -268,7 +284,6 @@ def find_group(blocks, query):
 def format_day_for_group(date_header, blocks, group_query):
     matches = find_group(blocks, group_query)
     if not matches:
-        # Подсказка: какие группы вообще есть
         all_groups = set()
         for b in blocks:
             for g in b['groups']:
@@ -500,7 +515,6 @@ def debug_links():
 
 @app.route('/debug/day/<date_str>', methods=['GET'])
 def debug_day(date_str):
-    """Показать, что именно скачивается и парсится для конкретной даты."""
     try:
         target = dt.datetime.strptime(date_str, '%Y-%m-%d').date()
     except ValueError:
