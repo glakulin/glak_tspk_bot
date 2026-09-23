@@ -29,7 +29,6 @@ SCHEDULE_PAGE_URL = 'http://www.tspk.org/studentam_sl/raspisanie-na-kazhdyj-den.
 schedule_cache = TTLCache(maxsize=30, ttl=1800)
 links_cache = TTLCache(maxsize=1, ttl=600)
 
-# ID последнего сообщения бота в каждом чате — чтобы удалять его при новом вводе
 last_bot_message = {}
 
 DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
@@ -199,28 +198,40 @@ def get_schedule_for_date(target_date):
     return date_header, all_blocks
 
 
-# --- ФОРМАТИРОВАНИЕ ---
+# --- ФОРМАТИРОВАНИЕ И ПОИСК ГРУППЫ ---
 
 def normalize(s):
-    return s.strip().upper().replace(' ', '').replace('\u00a0', '')
+    """
+    Убираем ВСЁ, кроме букв и цифр, приводим к верхнему регистру.
+    'исип41', 'ИСИП 41', 'исип-41', 'ИСиП-41 ' → 'ИСИП41'
+    """
+    if not s:
+        return ''
+    return re.sub(r'[^0-9A-Za-zА-Яа-яЁё]', '', s).upper()
 
 
 def find_group(blocks, query):
+    """Ищет группу в блоках, используя нормализованное сравнение."""
     q = normalize(query)
     if not q:
         return []
-    matches = []
+
+    # 1) Точное совпадение по нормализованной форме
+    exact = []
     for bi, block in enumerate(blocks):
         for g in block['groups']:
             if normalize(g) == q:
-                matches.append((bi, g))
-    if matches:
-        return matches
+                exact.append((bi, g))
+    if exact:
+        return exact
+
+    # 2) Частичное совпадение (нормализованная подстрока)
+    partial = []
     for bi, block in enumerate(blocks):
         for g in block['groups']:
             if q in normalize(g):
-                matches.append((bi, g))
-    return matches
+                partial.append((bi, g))
+    return partial
 
 
 def format_day_for_group(date_header, blocks, group_query):
@@ -259,36 +270,19 @@ def format_day_for_group(date_header, blocks, group_query):
     return "\n".join(lines)
 
 
-def build_week_text(group, today):
-    full = f"📅 Расписание на неделю для группы {group}\n"
-    has_any = False
-    for offset in range(7):
-        d = today + dt.timedelta(days=offset)
-        date_header, blocks = get_schedule_for_date(d)
-        if not blocks:
-            continue
-        text = format_day_for_group(date_header, blocks, group)
-        if "не найдена" in text or "не найдено" in text:
-            continue
-        has_any = True
-        full += f"\n\n📌 {DAY_NAMES[d.weekday()]}, {d.strftime('%d.%m.%Y')}\n{text}"
-
-    if not has_any:
-        return f"🔍 По группе «{group}» занятий на неделю не найдено."
-    return full
-
-
 # --- КНОПКИ ---
 
 def main_menu(group):
-    g = group.strip()[:30]
-    kb = InlineKeyboardMarkup(row_width=2)
+    # callback_data ограничен 64 байтами; кириллица = 2 байта/символ.
+    # "yesterday|" = 10 байт, значит группа — не больше 20 символов.
+    g = group.strip()[:20]
+    kb = InlineKeyboardMarkup(row_width=3)
     kb.add(
+        InlineKeyboardButton("📅 Вчера", callback_data=f"yesterday|{g}"),
         InlineKeyboardButton("📅 Сегодня", callback_data=f"today|{g}"),
         InlineKeyboardButton("📅 Завтра", callback_data=f"tomorrow|{g}"),
     )
     kb.add(
-        InlineKeyboardButton("📆 На неделю", callback_data=f"week|{g}"),
         InlineKeyboardButton("👥 Сменить группу", callback_data="change_group"),
     )
     return kb
@@ -318,7 +312,6 @@ def safe_edit(chat_id, message_id, text, reply_markup=None):
 
 
 def send_long(chat_id, text, reply_markup=None):
-    """Отправляет текст, разбивая его при необходимости. Возвращает ID последнего сообщения."""
     MAX = 4000
     if len(text) <= MAX:
         sent = bot.send_message(chat_id, text, reply_markup=reply_markup, timeout=10)
@@ -343,11 +336,6 @@ def send_long(chat_id, text, reply_markup=None):
 
 
 def send_or_edit(chat_id, message_id, text, reply_markup=None):
-    """
-    Пытается отредактировать существующее сообщение. Если не получается
-    (текст слишком длинный или сообщение слишком старое) — удаляет и шлёт новое.
-    Возвращает ID актуального сообщения.
-    """
     MAX = 4000
     if message_id and len(text) <= MAX:
         if safe_edit(chat_id, message_id, text, reply_markup):
@@ -359,7 +347,6 @@ def send_or_edit(chat_id, message_id, text, reply_markup=None):
 
 
 def send_fresh(chat_id, text, reply_markup=None):
-    """Удаляет предыдущее сообщение бота в этом чате и отправляет новое (для текстовых вводов)."""
     old_id = last_bot_message.pop(chat_id, None)
     if old_id:
         safe_delete(chat_id, old_id)
@@ -374,7 +361,8 @@ def start_message(msg):
     send_fresh(
         msg.chat.id,
         "👋 Привет! Я бот расписания ТСПК.\n\n"
-        "Напиши название своей группы (например, СД-21).",
+        "Напиши название своей группы (например, СД-21 или исип41) — "
+        "и я покажу кнопки для быстрого доступа.",
     )
 
 
@@ -394,14 +382,15 @@ def handle_callback(call):
     message_id = call.message.message_id
     data = call.data or ''
 
-    # Немедленно отвечаем на callback — до любых тяжёлых операций
+    # Мгновенно отвечаем на callback, чтобы Telegram не показывал «бот не отвечает»
     try:
         bot.answer_callback_query(call.id)
     except Exception as e:
         print(f"=== answer_callback_query ERROR === {e}", flush=True)
 
     if data == 'change_group':
-        new_id = send_or_edit(chat_id, message_id, "Напиши название своей группы (например, СД-21):", None)
+        new_id = send_or_edit(chat_id, message_id,
+                              "Напиши название своей группы (например, СД-21 или исип41):", None)
         last_bot_message[chat_id] = new_id
         return
 
@@ -413,24 +402,20 @@ def handle_callback(call):
 
     if action == 'today':
         target, label = today, 'сегодня'
+    elif action == 'yesterday':
+        target, label = today - dt.timedelta(days=1), 'вчера'
     elif action == 'tomorrow':
         target, label = today + dt.timedelta(days=1), 'завтра'
-    elif action == 'week':
-        target, label = None, 'неделю'
     else:
         return
 
-    # Сразу подменяем сообщение на «Загружаю...» — пользователь видит реакцию мгновенно
     send_or_edit(chat_id, message_id, f"⏳ Загружаю расписание на {label}...", None)
 
-    if action == 'week':
-        text = build_week_text(group, today)
+    date_header, blocks = get_schedule_for_date(target)
+    if not blocks:
+        text = f"😔 Не нашёл расписание на {target.strftime('%d.%m.%Y')}."
     else:
-        date_header, blocks = get_schedule_for_date(target)
-        if not blocks:
-            text = f"😔 Не нашёл расписание на {target.strftime('%d.%m.%Y')}."
-        else:
-            text = format_day_for_group(date_header, blocks, group)
+        text = format_day_for_group(date_header, blocks, group)
 
     new_id = send_or_edit(chat_id, message_id, text, main_menu(group))
     last_bot_message[chat_id] = new_id
