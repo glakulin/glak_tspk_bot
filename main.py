@@ -68,6 +68,7 @@ MONTHS_RU = [
 GROUP_PROMPT = ("Напиши название своей группы (например, СД-21 или исип41) "
                 "или выбери из списка:")
 PAGE_SIZE = 40  # групп на страницу (лимит Telegram — 100 кнопок)
+INCLUDE_HIDDEN_TABS = os.getenv('INCLUDE_HIDDEN_TABS') == '1'  # читать и скрытые вкладки
 
 
 # --- REDIS ---
@@ -178,6 +179,32 @@ def pop_last_msg(chat_id):
     last_bot_message.pop(chat_id, None)
     r_delete(f"tspk:lastmsg:{chat_id}")
     return old
+
+
+# Состояние диалога: 'teacher' = ждём фамилию преподавателя
+STATE_TTL = 600
+chat_state = {}  # запасной вариант, если Redis не подключён
+
+
+def get_state(chat_id):
+    if redis:
+        v = r_get(f"tspk:state:{chat_id}")
+        return str(v) if v else None
+    return chat_state.get(chat_id)
+
+
+def set_state(chat_id, state):
+    if redis:
+        r_set(f"tspk:state:{chat_id}", state, STATE_TTL)
+    else:
+        chat_state[chat_id] = state
+
+
+def clear_state(chat_id):
+    if redis:
+        r_delete(f"tspk:state:{chat_id}")
+    else:
+        chat_state.pop(chat_id, None)
 
 
 # --- ИЗВЛЕЧЕНИЕ ДАТ ИЗ HTML ---
@@ -384,7 +411,7 @@ def _download_and_parse(sheet):
         for ws in wb.worksheets:
             info = {'tab': ws.title, 'state': ws.sheet_state, 'used': False, 'blocks': 0}
             tabs_info.append(info)
-            if ws.sheet_state != 'visible' or not tab_allowed(ws.title):
+            if (ws.sheet_state != 'visible' and not INCLUDE_HIDDEN_TABS) or not tab_allowed(ws.title):
                 continue
             rows = [[cell_to_str(c) for c in row] for row in ws.iter_rows(values_only=True)]
             dh, blocks = parse_schedule_rows(rows, campus=ws.title.strip())
@@ -527,6 +554,145 @@ def format_day_for_group(date_header, blocks, group_query):
     return "\n".join(lines)
 
 
+# --- ПОИСК ПРЕПОДАВАТЕЛЯ ---
+
+# «Фамилия И.О.» (с дефисом в фамилии, инициалы с пробелом или без)
+TEACHER_RE = re.compile(r'([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)\s+([А-ЯЁ])\.\s?([А-ЯЁ])\.')
+MAX_TEACHERS_SHOWN = 6
+TEACHER_PROMPT = ("👨‍🏫 Введи фамилию преподавателя (например, Шаров или Шаров С.А.).\n"
+                  "Достаточно первых 3 букв.")
+
+
+def trunc_bytes(s, max_bytes):
+    """Обрезка по байтам: callback_data ≤ 64 байт, кириллица = 2 байта на букву."""
+    return s.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
+
+
+def norm_t(s):
+    return normalize(s).replace('Ё', 'Е')
+
+
+def clean_query(q):
+    return re.sub(r'\s+', ' ', (q or '').replace('|', ' ')).strip()
+
+
+def extract_teachers(cell):
+    result = []
+    for m in TEACHER_RE.finditer(cell):
+        name = f"{m.group(1)} {m.group(2)}.{m.group(3)}."
+        if name not in result:
+            result.append(name)
+    return result
+
+
+def index_teachers(blocks):
+    """{'Шаров С.А.': [{pair, time, group, campus, text}, ...]}"""
+    idx = {}
+    for b in blocks:
+        campus = b.get('campus', '')
+        for row in b['rows']:
+            for g in b['groups']:
+                cell = row['cells'].get(g, '').strip()
+                if not cell:
+                    continue
+                text = re.sub(r'\s+', ' ', cell)
+                for name in extract_teachers(cell):
+                    idx.setdefault(name, []).append({
+                        'pair': row['pair'], 'time': row['time'],
+                        'group': g, 'campus': campus, 'text': text,
+                    })
+    return idx
+
+
+def find_teachers(idx, query):
+    """Сначала точная фамилия/ФИО, потом начало, потом вхождение."""
+    q = norm_t(query)
+    if len(q) < 3:
+        return []
+    names = list(idx)
+    exact = [n for n in names if norm_t(n) == q or norm_t(n.split()[0]) == q]
+    if exact:
+        return exact
+    prefix = [n for n in names if norm_t(n).startswith(q)]
+    if prefix:
+        return prefix
+    return [n for n in names if q in norm_t(n)]
+
+
+def format_teacher_day(date_header, idx, names):
+    lines = []
+    if date_header:
+        lines.append(f"📅 {date_header}\n")
+
+    for name in sorted(names):
+        lines.append(f"👨‍🏫 {name}")
+        merged = {}
+        for l in idx[name]:
+            k = (l['pair'], l['campus'], l['text'])
+            m = merged.setdefault(k, {'time': l['time'], 'groups': []})
+            if l['group'] not in m['groups']:
+                m['groups'].append(l['group'])
+
+        def order(k):
+            return (int(k[0]) if k[0].isdigit() else 99, k[1], k[2])
+
+        for k in sorted(merged, key=order):
+            pair, campus, text = k
+            m = merged[k]
+            time_str = m['time'].replace('\n', '–').replace('  ', ' ').strip()
+            where = ', '.join(m['groups']) + (f" · {campus}" if campus else "")
+            lines.append(f"🔹 {pair} пара ({time_str})")
+            lines.append(f"   👥 {where}")
+            lines.append(f"   {text}")
+            lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def build_teacher_text(query, target_date, label):
+    date_header, blocks, actual_date = get_schedule_for_date(target_date)
+
+    if not blocks:
+        return (f"😔 На {label} ({target_date.strftime('%d.%m.%Y')}) расписания нет.")
+
+    idx = index_teachers(blocks)
+    names = find_teachers(idx, query)
+
+    if not names:
+        return (f"🔍 Преподаватель «{query}» на {actual_date.strftime('%d.%m.%Y')} "
+                f"в расписании не найден.\n\n"
+                f"Возможно, в этот день у него нет занятий, либо фамилия написана иначе.")
+
+    if len(names) > MAX_TEACHERS_SHOWN:
+        shown = ', '.join(sorted(names)[:15])
+        return (f"🔍 По запросу «{query}» найдено {len(names)} преподавателей: {shown}…\n\n"
+                f"Уточни запрос — фамилию или фамилию с инициалами.")
+
+    text = format_teacher_day(date_header, idx, names)
+    if actual_date != target_date:
+        text = (f"ℹ️ На {target_date.strftime('%d.%m.%Y')} расписания нет, "
+                f"показываю ближайшее: {actual_date.strftime('%d.%m.%Y')}\n\n" + text)
+    return text
+
+
+def teacher_menu(query):
+    q = trunc_bytes(clean_query(query), 40)
+    kb = InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        InlineKeyboardButton("📅 Вчера", callback_data=f"td|-1|{q}"),
+        InlineKeyboardButton("📅 Сегодня", callback_data=f"td|0|{q}"),
+        InlineKeyboardButton("📅 Завтра", callback_data=f"td|1|{q}"),
+    )
+    kb.add(InlineKeyboardButton("🔎 Другой преподаватель", callback_data="tsearch"))
+    kb.add(InlineKeyboardButton("🏠 Моё расписание", callback_data="home"))
+    return kb
+
+
+def teacher_prompt_menu():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="home"))
+    return kb
+
+
 # --- ВЫБОР ГРУППЫ ПО КОРПУСУ ---
 
 def campus_key(name):
@@ -556,7 +722,7 @@ def collect_groups():
 # --- КНОПКИ ---
 
 def main_menu(group):
-    g = group.strip()[:20]
+    g = trunc_bytes(group.strip(), 40)
     kb = InlineKeyboardMarkup(row_width=3)
     kb.add(
         InlineKeyboardButton("📅 Вчера", callback_data=f"yesterday|{g}"),
@@ -565,6 +731,7 @@ def main_menu(group):
     )
     kb.add(
         InlineKeyboardButton("👥 Сменить группу", callback_data="change_group"),
+        InlineKeyboardButton("👨‍🏫 Преподаватель", callback_data="tsearch"),
     )
     return kb
 
@@ -681,6 +848,7 @@ def send_fresh(chat_id, text, reply_markup=None):
 
 def start_message(msg):
     chat_id = msg.chat.id
+    clear_state(chat_id)
     group = get_saved_group(chat_id)
     if group:
         send_fresh(
@@ -697,6 +865,7 @@ def start_message(msg):
 
 
 def group_command(msg):
+    clear_state(msg.chat.id)
     send_fresh(msg.chat.id, GROUP_PROMPT, reply_markup=pick_button())
 
 
@@ -704,12 +873,37 @@ def handle_group_input(msg):
     group = (msg.text or '').strip()
     if not group or group.startswith('/'):
         return
+    if get_state(msg.chat.id) == 'teacher':
+        clear_state(msg.chat.id)
+        run_teacher_search(msg.chat.id, group)
+        return
     save_group(msg.chat.id, group)
     send_fresh(
         msg.chat.id,
         f"✅ Группа сохранена: {group}\n\nВыбери, что показать:",
         reply_markup=main_menu(group),
     )
+
+
+def run_teacher_search(chat_id, query):
+    query = clean_query(query)
+    if len(norm_t(query)) < 3:
+        set_state(chat_id, 'teacher')
+        send_fresh(chat_id, "Введи хотя бы 3 буквы фамилии.\n\n" + TEACHER_PROMPT,
+                   reply_markup=teacher_prompt_menu())
+        return
+    text = build_teacher_text(query, today_local(), 'сегодня')
+    send_fresh(chat_id, text, reply_markup=teacher_menu(query))
+
+
+def teacher_command(msg, arg):
+    chat_id = msg.chat.id
+    if arg:
+        clear_state(chat_id)
+        run_teacher_search(chat_id, arg)
+    else:
+        set_state(chat_id, 'teacher')
+        send_fresh(chat_id, TEACHER_PROMPT, reply_markup=teacher_prompt_menu())
 
 
 def build_schedule_text(group, target_date, label):
@@ -753,10 +947,12 @@ def handle_callback(call):
 
     # --- выбор группы ---
     if data == 'change_group':
+        clear_state(chat_id)
         show(GROUP_PROMPT, pick_button())
         return
 
     if data == 'pick':
+        clear_state(chat_id)
         send_or_edit(chat_id, message_id, "⏳ Загружаю список групп...", None)
         by_campus, _ = collect_groups()
         if not by_campus:
@@ -782,6 +978,32 @@ def handle_callback(call):
         group = data.split('|', 1)[1]
         save_group(chat_id, group)
         show(f"✅ Группа выбрана: {group}\n\nВыбери, что показать:", main_menu(group))
+        return
+
+    # --- преподаватель ---
+    if data == 'tsearch':
+        set_state(chat_id, 'teacher')
+        show(TEACHER_PROMPT, teacher_prompt_menu())
+        return
+
+    if data == 'home':
+        clear_state(chat_id)
+        group = get_saved_group(chat_id)
+        if group:
+            show("Выбери, что показать:", main_menu(group))
+        else:
+            show(GROUP_PROMPT, pick_button())
+        return
+
+    if data.startswith('td|'):
+        parts = data.split('|', 2)
+        labels = {'-1': 'вчера', '0': 'сегодня', '1': 'завтра'}
+        if len(parts) < 3 or parts[1] not in labels:
+            return
+        query = parts[2]
+        target = today_local() + dt.timedelta(days=int(parts[1]))
+        send_or_edit(chat_id, message_id, f"⏳ Ищу «{query}» на {labels[parts[1]]}...", None)
+        show(build_teacher_text(query, target, labels[parts[1]]), teacher_menu(query))
         return
 
     # --- расписание ---
@@ -876,6 +1098,30 @@ def debug_day(date_str):
     return jsonify(out)
 
 
+@app.route('/debug/teachers/<date_str>', methods=['GET'])
+def debug_teachers(date_str):
+    try:
+        target = dt.datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'error': 'expected YYYY-MM-DD'}), 400
+    date_header, blocks, actual = get_schedule_for_date(target)
+    idx = index_teachers(blocks)
+    no_teacher = []
+    for b in blocks:
+        for row in b['rows']:
+            for g in b['groups']:
+                cell = row['cells'].get(g, '').strip()
+                if cell and not extract_teachers(cell):
+                    no_teacher.append(f"{b.get('campus')} | {g} | {re.sub(chr(10), ' ', cell)[:120]}")
+    return jsonify({
+        'actual_date': actual.isoformat(),
+        'teachers_count': len(idx),
+        'teachers': {n: len(v) for n, v in sorted(idx.items())},
+        'cells_without_teacher_count': len(no_teacher),
+        'cells_without_teacher_sample': no_teacher[:25],
+    })
+
+
 @app.route('/', methods=['POST'])
 def webhook():
     try:
@@ -886,10 +1132,13 @@ def webhook():
             msg = update.message
             text = (msg.text or '').strip()
             print(f"=== WEBHOOK === message: {text[:60]}", flush=True)
-            if text == '/start':
+            cmd = text.split()[0].split('@')[0].lower() if text.startswith('/') else ''
+            if cmd == '/start':
                 start_message(msg)
-            elif text == '/group':
+            elif cmd == '/group':
                 group_command(msg)
+            elif cmd == '/teacher':
+                teacher_command(msg, text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else '')
             else:
                 handle_group_input(msg)
 
