@@ -169,14 +169,14 @@ def format_schedule(df, group_name):
 
 @bot.message_handler(commands=['start'])
 def start_message(message):
-    print(f"=== START HANDLER === chat_id={message.chat.id}, text={message.text}", flush=True)
+    print(f"=== START HANDLER === chat_id={message.chat.id}", flush=True)
     try:
-        bot.send_message(
-            message.chat.id,
-            "Привет! 👋 Я бот для просмотра расписания ТСПК.\n\n"
-            "Пожалуйста, напиши мне название своей группы (например, СД-21)."
-        )
-        print("=== START HANDLER === Ответ отправлен", flush=True)
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        r = requests.post(url, json={
+            "chat_id": message.chat.id,
+            "text": "Привет! Бот работает. Напиши название группы.",
+        }, timeout=5)
+        print(f"=== START HANDLER === Raw response: {r.status_code} {r.text[:200]}", flush=True)
     except Exception as e:
         print(f"=== START HANDLER ERROR === {e}", flush=True)
         traceback.print_exc()
@@ -277,25 +277,29 @@ def webhook():
     print("=== WEBHOOK HIT ===", flush=True)
     try:
         raw = request.get_data().decode('utf-8')
-        print(f"=== WEBHOOK === Content-Type: {request.headers.get('content-type')}", flush=True)
-        print(f"=== WEBHOOK === Raw data (500 символов): {raw[:500]}", flush=True)
+        update = telebot.types.Update.de_json(raw)
+        print(f"=== WEBHOOK === text={update.message.text if update.message else None}", flush=True)
 
-        if request.headers.get('content-type') == 'application/json':
-            update = telebot.types.Update.de_json(raw)
-            print(f"=== WEBHOOK === Update распарсен: {update}", flush=True)
-
-            if update.message:
-                print(f"=== WEBHOOK === message.text={update.message.text}", flush=True)
-                print(f"=== WEBHOOK === chat.id={update.message.chat.id}", flush=True)
-            else:
-                print("=== WEBHOOK === update.message отсутствует", flush=True)
-
-            bot.process_new_updates([update])
-            print("=== WEBHOOK === process_new_updates завершён", flush=True)
+        if not update.message:
             return '', 200
 
-        print("=== WEBHOOK === Content-Type не application/json, возвращаю 403", flush=True)
-        return '', 403
+        msg = update.message
+        text = (msg.text or '').strip()
+
+        # Явный синхронный вызов обработчиков
+        if text == '/start':
+            start_message(msg)
+        elif text == '/today':
+            today_schedule(msg)
+        elif text == '/tomorrow':
+            tomorrow_schedule(msg)
+        elif text == '/week':
+            week_schedule(msg)
+        else:
+            handle_group_input(msg)
+
+        print("=== WEBHOOK === Обработчик завершён", flush=True)
+        return '', 200
 
     except Exception as e:
         print(f"=== WEBHOOK ERROR === {e}", flush=True)
