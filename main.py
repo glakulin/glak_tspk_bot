@@ -125,14 +125,45 @@ def format_schedule(df, group_name):
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 
+@app.route('/', methods=['POST'])
+def webhook():
+    import traceback
+    try:
+        print("=== WEBHOOK HIT ===")
+        print("Content-Type:", request.headers.get('content-type'))
+        raw = request.get_data().decode('utf-8')
+        print("Raw data (first 300 chars):", raw[:300])
+
+        if request.headers.get('content-type') == 'application/json':
+            update = telebot.types.Update.de_json(raw)
+            print("Update parsed. message =", update.message)
+            if update.message:
+                print("Text:", update.message.text)
+                print("Chat ID:", update.message.chat.id)
+            bot.process_new_updates([update])
+            print("=== UPDATE PROCESSED ===")
+            return '', 200
+        return '', 403
+    except Exception:
+        print("=== EXCEPTION IN WEBHOOK ===")
+        traceback.print_exc()
+        return '', 200
+
+
 @bot.message_handler(commands=['start'])
 def start_message(message):
-    bot.send_message(
-        message.chat.id,
-        "Привет! 👋 Я бот для просмотра расписания ТСПК.\n\n"
-        "Пожалуйста, напиши мне название своей группы (например, *СД-21*).",
-        parse_mode='Markdown'
-    )
+    print("=== START HANDLER CALLED ===")
+    try:
+        bot.send_message(
+            message.chat.id,
+            "Привет! 👋 Я бот для просмотра расписания ТСПК.\n\n"
+            "Пожалуйста, напиши мне название своей группы (например, *СД-21*).",
+            parse_mode='Markdown'
+        )
+        print("=== START REPLY SENT ===")
+    except Exception:
+        import traceback
+        traceback.print_exc()
 
 
 @bot.message_handler(commands=['today'])
@@ -209,13 +240,3 @@ def handle_group_input(message):
 @app.route('/', methods=['GET'])
 def index():
     return "Telegram bot is running.", 200
-
-
-@app.route('/', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    return '', 403
