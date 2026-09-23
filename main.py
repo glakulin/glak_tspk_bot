@@ -2,13 +2,13 @@ import os
 import re
 import csv
 import traceback
+import datetime as dt
 import telebot
 import requests
 from bs4 import BeautifulSoup
 from io import StringIO
-from datetime import datetime
 from cachetools import TTLCache
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- НАСТРОЙКИ ---
@@ -26,48 +26,113 @@ app = Flask(__name__)
 
 SCHEDULE_PAGE_URL = 'http://www.tspk.org/studentam_sl/raspisanie-na-kazhdyj-den.html'
 
-schedule_cache = TTLCache(maxsize=20, ttl=1800)
-links_cache = TTLCache(maxsize=1, ttl=21600)
+schedule_cache = TTLCache(maxsize=30, ttl=1800)
+links_cache = TTLCache(maxsize=1, ttl=600)  # 10 минут
 
 DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
 
 
-# --- ПАРСИНГ ССЫЛОК ---
+# --- ПАРСИНГ СТРАНИЦЫ СО ССЫЛКАМИ ---
 
-def extract_sheet_ids():
-    if 'sheet_ids' in links_cache:
-        return links_cache['sheet_ids']
+def extract_sheet_links():
+    """Возвращает список: [{'sheet_id', 'anchor', 'context', 'date', 'building'}, ...]."""
+    if 'links' in links_cache:
+        return links_cache['links']
 
-    try:
-        r = requests.get(SCHEDULE_PAGE_URL, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, 'html.parser')
-        pattern = re.compile(r'docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_-]+)')
+    r = requests.get(SCHEDULE_PAGE_URL, timeout=15)
+    r.raise_for_status()
+    # Сайт старый — может отдавать windows-1251, но requests должен сам угадать
+    if r.encoding is None or r.encoding.lower() == 'iso-8859-1':
+        r.encoding = 'utf-8'
 
-        all_links = []
-        for a in soup.find_all('a', href=True):
-            m = pattern.search(a['href'])
-            if m:
-                all_links.append(m.group(1))
+    soup = BeautifulSoup(r.text, 'html.parser')
+    pattern = re.compile(r'docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_-]+)')
 
-        sheet_ids = {}
-        for i, sid in enumerate(all_links[:7]):
-            sheet_ids[i] = sid
+    links = []
+    for a in soup.find_all('a', href=True):
+        m = pattern.search(a['href'])
+        if not m:
+            continue
 
-        print(f"=== extract_sheet_ids === Найдено {len(sheet_ids)} таблиц", flush=True)
-        links_cache['sheet_ids'] = sheet_ids
-        return sheet_ids
-    except Exception as e:
-        print(f"=== extract_sheet_ids ERROR === {e}", flush=True)
-        return {}
+        sheet_id = m.group(1)
+        anchor = a.get_text(' ', strip=True)
+
+        # Собираем контекст: текст ссылки + текст родителя + текст ближайших предков
+        ctx_parts = [anchor]
+        node = a
+        for _ in range(4):
+            node = node.parent
+            if node is None:
+                break
+            if node.name in ('td', 'th', 'li', 'p', 'div', 'h1', 'h2', 'h3', 'h4', 'tr'):
+                ctx_parts.append(node.get_text(' ', strip=True))
+                if node.name in ('td', 'th', 'li', 'h1', 'h2', 'h3', 'h4'):
+                    break
+
+        context = ' '.join(ctx_parts)
+
+        # Ищем дату ДД.ММ.ГГГГ в контексте
+        date_str = None
+        dm = re.search(r'(\d{2})[.\-/](\d{2})[.\-/](\d{4})', context)
+        if dm:
+            date_str = f"{dm.group(1)}.{dm.group(2)}.{dm.group(3)}"
+
+        # Ищем упоминание корпуса
+        bm = re.search(r'(\d)\s*корпус', context, re.IGNORECASE)
+        building = bm.group(1) if bm else None
+
+        links.append({
+            'sheet_id': sheet_id,
+            'anchor': anchor,
+            'context': context[:250],
+            'date': date_str,
+            'building': building,
+        })
+
+    print(f"=== extract_sheet_links === найдено {len(links)} ссылок", flush=True)
+    for i, l in enumerate(links[:30]):
+        print(f"  [{i}] date={l['date']} bld={l['building']} anchor='{l['anchor'][:70]}'", flush=True)
+
+    links_cache['links'] = links
+    return links
 
 
-# --- ПАРСИНГ РАСПИСАНИЯ ---
+def find_sheets_for_date(target_date):
+    """target_date: datetime.date → список ссылок на эту дату."""
+    links = extract_sheet_links()
+    date_str = target_date.strftime('%d.%m.%Y')
+
+    matching = [l for l in links if l['date'] == date_str]
+    if matching:
+        return matching, target_date
+
+    # Fallback: ближайшая будущая дата
+    candidates = []
+    for l in links:
+        if not l['date']:
+            continue
+        try:
+            d = dt.datetime.strptime(l['date'], '%d.%m.%Y').date()
+        except ValueError:
+            continue
+        if d >= target_date:
+            candidates.append((d, l))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        nearest = candidates[0][0]
+        print(f"=== find_sheets_for_date === fallback на {nearest}", flush=True)
+        return [l for d, l in candidates if d == nearest], nearest
+
+    return [], target_date
+
+
+# --- ПАРСИНГ CSV ---
 
 def parse_schedule_csv(text):
     """
     Возвращает (date_header, blocks).
-    blocks — список словарей: {'groups': [...], 'rows': [{'pair','time','cells':{group: text}}]}
+    block = {'groups': [...], 'building': None, 'rows': [{'pair','time','cells':{group: text}}]}
     """
     reader = csv.reader(StringIO(text))
     rows = list(reader)
@@ -77,82 +142,92 @@ def parse_schedule_csv(text):
     current = None
 
     for row in rows:
-        if not any(c.strip() for c in row):
+        if not row or not any(c.strip() for c in row):
             continue
 
-        first = row[0].strip().lower() if row else ''
+        first = row[0].strip()
         second = row[1].strip().lower() if len(row) > 1 else ''
 
-        # Заголовок блока: "Пара,Время,<группы...>"
-        if first == 'пара' and second == 'время':
+        # Заголовок блока «Пара, Время, группы...»
+        if first.lower() == 'пара' and second == 'время':
             groups = [c.strip() for c in row[2:]]
             while groups and not groups[-1]:
                 groups.pop()
-            current = {'groups': groups, 'rows': []}
+            current = {'groups': groups, 'building': None, 'rows': []}
             blocks.append(current)
             continue
 
         # Первая строка файла с датой
-        if date_header is None and first.startswith('расписание'):
-            date_header = row[0].split(',')[0].strip()
+        if date_header is None and first.lower().startswith('расписание'):
+            date_header = first.split(',')[0].strip()
             continue
 
-        # Строка данных: первый столбец — номер пары
+        # Строка с номером пары
         if current is not None and first.isdigit():
-            pair = row[0].strip()
             time_slot = row[1].strip() if len(row) > 1 else ''
             cells = {}
             for i, g in enumerate(current['groups']):
                 cells[g] = row[i + 2].strip() if i + 2 < len(row) else ''
-            current['rows'].append({'pair': pair, 'time': time_slot, 'cells': cells})
+            current['rows'].append({
+                'pair': first,
+                'time': time_slot,
+                'cells': cells,
+            })
 
     return date_header, blocks
 
 
-def get_schedule_for_day(day_idx):
-    if day_idx in schedule_cache:
-        return schedule_cache[day_idx]
+def get_schedule_for_date(target_date):
+    """Возвращает (date_header, blocks). Кэширует по дате."""
+    key = target_date.strftime('%Y-%m-%d')
+    if key in schedule_cache:
+        return schedule_cache[key]
 
-    sheet_ids = extract_sheet_ids()
-    sid = sheet_ids.get(day_idx)
-    if not sid:
+    sheets, actual_date = find_sheets_for_date(target_date)
+    if not sheets:
+        print(f"=== get_schedule_for_date === нет ссылок на {target_date}", flush=True)
         return None, []
 
-    url = f'https://docs.google.com/spreadsheets/d/{sid}/export?format=csv'
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        date_header, blocks = parse_schedule_csv(r.text)
-        schedule_cache[day_idx] = (date_header, blocks)
-        print(f"=== get_schedule_for_day === День {day_idx}: блоков {len(blocks)}", flush=True)
-        return date_header, blocks
-    except Exception as e:
-        print(f"=== get_schedule_for_day ERROR === {e}", flush=True)
-        traceback.print_exc()
-        return None, []
+    all_blocks = []
+    date_header = None
+
+    for sheet in sheets:
+        url = f'https://docs.google.com/spreadsheets/d/{sheet["sheet_id"]}/export?format=csv'
+        try:
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            dh, blocks = parse_schedule_csv(r.text)
+            if dh and not date_header:
+                date_header = dh
+            for b in blocks:
+                b['building'] = sheet.get('building')
+            all_blocks.extend(blocks)
+            print(f"=== get_schedule_for_date === {sheet['sheet_id'][:12]}... → блоков {len(blocks)}", flush=True)
+        except Exception as e:
+            print(f"=== get_schedule_for_date ERROR === {sheet['sheet_id'][:12]}: {e}", flush=True)
+
+    schedule_cache[key] = (date_header, all_blocks)
+    return date_header, all_blocks
 
 
 # --- ФОРМАТИРОВАНИЕ ---
 
 def normalize(s):
-    return s.strip().upper().replace(' ', '')
+    return s.strip().upper().replace(' ', '').replace('\u00a0', '')
 
 
 def find_group(blocks, query):
-    """Возвращает список (индекс_блока, имя_группы_в_таблице)."""
     q = normalize(query)
     matches = []
-    # Сначала ищем точное совпадение
     for bi, block in enumerate(blocks):
         for g in block['groups']:
             if normalize(g) == q:
                 matches.append((bi, g))
     if matches:
         return matches
-    # Если точного нет — ищем частичное
     for bi, block in enumerate(blocks):
         for g in block['groups']:
-            if q in normalize(g):
+            if q and q in normalize(g):
                 matches.append((bi, g))
     return matches
 
@@ -175,7 +250,7 @@ def format_day_for_group(date_header, blocks, group_query):
             if not cell:
                 continue
             time_str = row['time'].replace('\n', '–').replace('  ', ' ').strip()
-            block_lines.append(f"🔹 *{row['pair']} пара* ({time_str})")
+            block_lines.append(f"🔹 {row['pair']} пара ({time_str})")
             for l in cell.split('\n'):
                 l = l.strip()
                 if l:
@@ -184,7 +259,8 @@ def format_day_for_group(date_header, blocks, group_query):
 
         if block_lines:
             has_content = True
-            lines.append(f"👥 Группа *{g.strip()}*")
+            bld = f" · корпус {block['building']}" if block.get('building') else ""
+            lines.append(f"👥 Группа {g.strip()}{bld}")
             lines.extend(block_lines)
 
     if not has_content:
@@ -196,29 +272,26 @@ def format_day_for_group(date_header, blocks, group_query):
 # --- КНОПКИ ---
 
 def main_menu(group):
-    # callback_data ограничен 64 байтами — обрезаем группу при необходимости
     g = group.strip()[:30]
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
         InlineKeyboardButton("📅 Сегодня", callback_data=f"today|{g}"),
         InlineKeyboardButton("📅 Завтра", callback_data=f"tomorrow|{g}"),
     )
-    markup.add(
+    kb.add(
         InlineKeyboardButton("📆 На неделю", callback_data=f"week|{g}"),
         InlineKeyboardButton("👥 Сменить группу", callback_data="change_group"),
     )
-    return markup
+    return kb
 
 
 def send_long(chat_id, text, reply_markup=None):
     MAX = 4000
     if len(text) <= MAX:
-        bot.send_message(chat_id, text, reply_markup=reply_markup,
-                         parse_mode='Markdown', timeout=10)
+        bot.send_message(chat_id, text, reply_markup=reply_markup, timeout=10)
         return
 
-    parts = []
-    current = ""
+    parts, current = [], ""
     for line in text.split('\n'):
         if len(current) + len(line) + 1 > MAX:
             parts.append(current)
@@ -230,20 +303,22 @@ def send_long(chat_id, text, reply_markup=None):
 
     for i, part in enumerate(parts):
         markup = reply_markup if i == len(parts) - 1 else None
-        bot.send_message(chat_id, part, reply_markup=markup,
-                         parse_mode='Markdown', timeout=10)
+        bot.send_message(chat_id, part, reply_markup=markup, timeout=10)
 
 
 # --- ОТПРАВКА РАСПИСАНИЯ ---
 
-def send_day(chat_id, group, day_idx, label):
-    print(f"=== send_day === {label}, группа={group}", flush=True)
-    bot.send_message(chat_id, f"⏳ Загружаю расписание на {label}...", timeout=10)
+def send_day(chat_id, group, target_date, label):
+    print(f"=== send_day === {label}, {target_date}, группа={group}", flush=True)
+    bot.send_message(chat_id, f"⏳ Загружаю расписание на {label} ({target_date.strftime('%d.%m.%Y')})...", timeout=10)
 
-    date_header, blocks = get_schedule_for_day(day_idx)
+    date_header, blocks = get_schedule_for_date(target_date)
     if not blocks:
-        bot.send_message(chat_id, "😔 Не удалось загрузить расписание. Попробуйте позже.",
-                         reply_markup=main_menu(group), timeout=10)
+        bot.send_message(
+            chat_id,
+            f"😔 Не нашёл расписание на {target_date.strftime('%d.%m.%Y')}.",
+            reply_markup=main_menu(group), timeout=10,
+        )
         return
 
     text = format_day_for_group(date_header, blocks, group)
@@ -254,22 +329,27 @@ def send_week(chat_id, group):
     print(f"=== send_week === группа={group}", flush=True)
     bot.send_message(chat_id, "⏳ Собираю расписание на неделю...", timeout=10)
 
-    full = f"📅 *Расписание на неделю для группы {group}*\n"
+    today = dt.date.today()
+    full = f"📅 Расписание на неделю для группы {group}\n"
     has_any = False
 
-    for day_idx in range(7):
-        date_header, blocks = get_schedule_for_day(day_idx)
+    for offset in range(7):
+        d = today + dt.timedelta(days=offset)
+        date_header, blocks = get_schedule_for_date(d)
         if not blocks:
             continue
         text = format_day_for_group(date_header, blocks, group)
         if "не найдена" in text or "не найдено" in text:
             continue
         has_any = True
-        full += f"\n\n*{DAY_NAMES[day_idx]}*\n{text}"
+        full += f"\n\n📌 {DAY_NAMES[d.weekday()]}, {d.strftime('%d.%m.%Y')}\n{text}"
 
     if not has_any:
-        bot.send_message(chat_id, f"🔍 По группе «{group}» занятий на неделю не найдено.",
-                         reply_markup=main_menu(group), timeout=10)
+        bot.send_message(
+            chat_id,
+            f"🔍 По группе «{group}» занятий на неделю не найдено.",
+            reply_markup=main_menu(group), timeout=10,
+        )
         return
 
     send_long(chat_id, full, reply_markup=main_menu(group))
@@ -281,9 +361,8 @@ def start_message(msg):
     bot.send_message(
         msg.chat.id,
         "👋 Привет! Я бот расписания ТСПК.\n\n"
-        "Напиши название своей группы (например, *СД-21*), "
+        "Напиши название своей группы (например, СД-21), "
         "и я покажу кнопки для быстрого доступа.",
-        parse_mode='Markdown',
         timeout=10,
     )
 
@@ -294,8 +373,7 @@ def handle_group_input(msg):
         return
     bot.send_message(
         msg.chat.id,
-        f"✅ Группа сохранена: *{group}*\n\nВыбери, что показать:",
-        parse_mode='Markdown',
+        f"✅ Группа сохранена: {group}\n\nВыбери, что показать:",
         reply_markup=main_menu(group),
         timeout=10,
     )
@@ -311,19 +389,19 @@ def handle_callback(call):
     data = call.data or ''
 
     if data == 'change_group':
-        bot.send_message(chat_id, "Напиши название своей группы (например, *СД-21*):",
-                         parse_mode='Markdown', timeout=10)
+        bot.send_message(chat_id, "Напиши название своей группы (например, СД-21):", timeout=10)
         return
 
     if '|' not in data:
         return
 
     action, group = data.split('|', 1)
+    today = dt.date.today()
 
     if action == 'today':
-        send_day(chat_id, group, datetime.now().weekday(), 'сегодня')
+        send_day(chat_id, group, today, 'сегодня')
     elif action == 'tomorrow':
-        send_day(chat_id, group, (datetime.now().weekday() + 1) % 7, 'завтра')
+        send_day(chat_id, group, today + dt.timedelta(days=1), 'завтра')
     elif action == 'week':
         send_week(chat_id, group)
 
@@ -335,9 +413,20 @@ def index():
     return "Telegram bot is running.", 200
 
 
+@app.route('/debug', methods=['GET'])
+def debug_links():
+    """Диагностика: показывает, какие ссылки нашлись на странице."""
+    links = extract_sheet_links()
+    return jsonify({
+        'count': len(links),
+        'links': [{'date': l['date'], 'building': l['building'],
+                   'anchor': l['anchor'][:120], 'context': l['context'][:200]}
+                  for l in links],
+    })
+
+
 @app.route('/', methods=['POST'])
 def webhook():
-    print("=== WEBHOOK HIT ===", flush=True)
     try:
         raw = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(raw)
@@ -348,10 +437,6 @@ def webhook():
             print(f"=== WEBHOOK === message: {text[:60]}", flush=True)
             if text == '/start':
                 start_message(msg)
-            elif text == '/today' or text == '/tomorrow' or text == '/week':
-                bot.send_message(msg.chat.id,
-                                 "Сначала укажи группу (например, *СД-21*).",
-                                 parse_mode='Markdown', timeout=10)
             else:
                 handle_group_input(msg)
 
@@ -359,7 +444,6 @@ def webhook():
             print(f"=== WEBHOOK === callback: {update.callback_query.data}", flush=True)
             handle_callback(update.callback_query)
 
-        print("=== WEBHOOK === OK", flush=True)
         return '', 200
     except Exception as e:
         print(f"=== WEBHOOK ERROR === {e}", flush=True)
