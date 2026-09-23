@@ -1,15 +1,24 @@
 import os
 import re
-import csv
+import json
+import hashlib
 import traceback
 import datetime as dt
+from io import BytesIO
+from zoneinfo import ZoneInfo
+
 import telebot
 import requests
+import openpyxl
 from bs4 import BeautifulSoup
-from io import StringIO
 from cachetools import TTLCache
 from flask import Flask, request, jsonify
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+try:
+    from upstash_redis import Redis
+except ImportError:  # без библиотеки бот работает без Redis
+    Redis = None
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -26,10 +35,27 @@ app = Flask(__name__)
 
 SCHEDULE_PAGE_URL = 'http://www.tspk.org/studentam_sl/raspisanie-na-kazhdyj-den.html'
 
-schedule_cache = TTLCache(maxsize=30, ttl=1800)
-links_cache = TTLCache(maxsize=1, ttl=600)
+# Часовой пояс Самары (UTC+4). Запасной вариант, если нет базы tz.
+try:
+    TZ = ZoneInfo('Europe/Samara')
+except Exception:
+    TZ = dt.timezone(dt.timedelta(hours=4))
 
-last_bot_message = {}
+
+def today_local():
+    return dt.datetime.now(TZ).date()
+
+
+# Кэш в памяти (живёт, пока «тёплый» инстанс) + Redis (общий между вызовами)
+SCHEDULE_TTL = 1800
+LINKS_TTL = 600
+LASTMSG_TTL = 172800  # 48 ч: старее Telegram всё равно не даёт удалять
+CACHE_VERSION = 'v2'  # поменять при изменении формата кэша
+
+schedule_cache = TTLCache(maxsize=30, ttl=SCHEDULE_TTL)
+links_cache = TTLCache(maxsize=1, ttl=LINKS_TTL)
+
+last_bot_message = {}  # запасной вариант, если Redis недоступен
 
 DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
 
@@ -38,6 +64,120 @@ MONTHS_RU = [
     ('май', 5), ('мая', 5), ('июн', 6), ('июл', 7), ('август', 8),
     ('сентябр', 9), ('октябр', 10), ('ноябр', 11), ('декабр', 12),
 ]
+
+GROUP_PROMPT = ("Напиши название своей группы (например, СД-21 или исип41) "
+                "или выбери из списка:")
+PAGE_SIZE = 40  # групп на страницу (лимит Telegram — 100 кнопок)
+
+
+# --- REDIS ---
+
+def _make_redis():
+    if Redis is None:
+        print("=== REDIS === библиотека upstash-redis не установлена", flush=True)
+        return None
+    url = os.getenv('KV_REST_API_URL') or os.getenv('UPSTASH_REDIS_REST_URL')
+    token = os.getenv('KV_REST_API_TOKEN') or os.getenv('UPSTASH_REDIS_REST_TOKEN')
+    if not url or not token:
+        print("=== REDIS === переменные не заданы, работаю без Redis", flush=True)
+        return None
+    print("=== REDIS === подключён", flush=True)
+    return Redis(url=url, token=token)
+
+
+redis = _make_redis()
+
+
+def ckey(*parts):
+    return 'tspk:' + CACHE_VERSION + ':' + ':'.join(str(p) for p in parts)
+
+
+def r_get(key):
+    if not redis:
+        return None
+    try:
+        return redis.get(key)
+    except Exception as e:
+        print(f"=== redis get ERROR === {key}: {e}", flush=True)
+        return None
+
+
+def r_set(key, value, ex=None):
+    if not redis:
+        return False
+    try:
+        if ex:
+            redis.set(key, value, ex=ex)
+        else:
+            redis.set(key, value)
+        return True
+    except Exception as e:
+        print(f"=== redis set ERROR === {key}: {e}", flush=True)
+        return False
+
+
+def r_delete(key):
+    if not redis:
+        return
+    try:
+        redis.delete(key)
+    except Exception as e:
+        print(f"=== redis delete ERROR === {key}: {e}", flush=True)
+
+
+def r_get_json(key):
+    raw = r_get(key)
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        print(f"=== redis json ERROR === {key}: {e}", flush=True)
+        return None
+
+
+def r_set_json(key, value, ex=None):
+    try:
+        return r_set(key, json.dumps(value, ensure_ascii=False), ex)
+    except Exception as e:
+        print(f"=== redis dumps ERROR === {key}: {e}", flush=True)
+        return False
+
+
+# Сохранённая группа по chat_id
+def get_saved_group(chat_id):
+    v = r_get(f"tspk:group:{chat_id}")
+    return str(v) if v else None
+
+
+def save_group(chat_id, group):
+    r_set(f"tspk:group:{chat_id}", group)
+
+
+# id последнего сообщения бота (для режима «одно сообщение»)
+def get_last_msg(chat_id):
+    if chat_id in last_bot_message:
+        return last_bot_message[chat_id]
+    v = r_get(f"tspk:lastmsg:{chat_id}")
+    try:
+        return int(v) if v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def set_last_msg(chat_id, message_id):
+    if message_id:
+        last_bot_message[chat_id] = message_id
+        r_set(f"tspk:lastmsg:{chat_id}", str(message_id), LASTMSG_TTL)
+
+
+def pop_last_msg(chat_id):
+    old = get_last_msg(chat_id)
+    last_bot_message.pop(chat_id, None)
+    r_delete(f"tspk:lastmsg:{chat_id}")
+    return old
 
 
 # --- ИЗВЛЕЧЕНИЕ ДАТ ИЗ HTML ---
@@ -75,6 +215,20 @@ def extract_sheet_links():
     if 'links' in links_cache:
         return links_cache['links']
 
+    cached = r_get_json(ckey('links'))
+    if cached:
+        try:
+            links = [
+                {'sheet_id': l['sheet_id'], 'anchor': l['anchor'],
+                 'date': dt.date.fromisoformat(l['date']) if l['date'] else None}
+                for l in cached
+            ]
+            links_cache['links'] = links
+            print(f"=== extract_sheet_links === из Redis, total={len(links)}", flush=True)
+            return links
+        except Exception as e:
+            print(f"=== extract_sheet_links === битый кэш Redis: {e}", flush=True)
+
     r = requests.get(SCHEDULE_PAGE_URL, timeout=15)
     r.raise_for_status()
     html = r.content.decode('utf-8', errors='replace')
@@ -109,8 +263,16 @@ def extract_sheet_links():
 
         links.append({'sheet_id': sheet_id, 'anchor': anchor, 'date': date_obj})
 
-    links_cache['links'] = links
     print(f"=== extract_sheet_links === total={len(links)}, with_date={sum(1 for l in links if l['date'])}", flush=True)
+
+    if links:
+        links_cache['links'] = links
+        r_set_json(
+            ckey('links'),
+            [{'sheet_id': l['sheet_id'], 'anchor': l['anchor'],
+              'date': l['date'].isoformat() if l['date'] else None} for l in links],
+            LINKS_TTL,
+        )
     return links
 
 
@@ -145,10 +307,8 @@ def clean_group_name(g):
     """
     Оставляет только название группы в начале строки:
     буквы + (дефис или пробел)? + цифры.
-    Всё, что идёт после — отбрасывается.
     'ИСиП-41 2 смена' → 'ИСиП-41'
     'НК-21 (1 смена)' → 'НК-21'
-    'Д-41 ' → 'Д-41'
     """
     if not g:
         return g
@@ -159,12 +319,22 @@ def clean_group_name(g):
     return g
 
 
-# --- ПАРСИНГ CSV ---
+# --- ПАРСИНГ XLSX (все вкладки: корпуса, заочное и т.д.) ---
 
-def parse_schedule_csv(text):
-    reader = csv.reader(StringIO(text))
-    rows = list(reader)
+def cell_to_str(v):
+    if v is None:
+        return ''
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip()
 
+
+def tab_allowed(title):
+    """Сейчас берутся все видимые вкладки. Чтобы исключить какую-то — вернуть False."""
+    return True
+
+
+def parse_schedule_rows(rows, campus=''):
     date_header = None
     blocks = []
     current = None
@@ -181,7 +351,7 @@ def parse_schedule_csv(text):
             while raw_groups and not raw_groups[-1]:
                 raw_groups.pop()
             groups = [clean_group_name(g) for g in raw_groups]
-            current = {'groups': groups, 'rows': []}
+            current = {'groups': groups, 'rows': [], 'campus': campus}
             blocks.append(current)
             continue
 
@@ -201,16 +371,29 @@ def parse_schedule_csv(text):
 
 def _download_and_parse(sheet):
     """
-    Скачивает CSV и парсит. Читает как UTF-8 (Google отдаёт CSV без charset
-    в заголовке, из-за чего requests по умолчанию использует ISO-8859-1).
+    Скачивает xlsx (все вкладки в одном файле) и парсит каждую видимую вкладку.
+    Возвращает (date_header, blocks, error, tabs_info).
     """
-    url = f'https://docs.google.com/spreadsheets/d/{sheet["sheet_id"]}/export?format=csv'
+    url = f'https://docs.google.com/spreadsheets/d/{sheet["sheet_id"]}/export?format=xlsx'
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=25)
         r.raise_for_status()
-        text = r.content.decode('utf-8', errors='replace')
-        dh, blocks = parse_schedule_csv(text)
-        return dh, blocks, None, text[:300]
+        wb = openpyxl.load_workbook(BytesIO(r.content), data_only=True)
+
+        date_header, all_blocks, tabs_info = None, [], []
+        for ws in wb.worksheets:
+            info = {'tab': ws.title, 'state': ws.sheet_state, 'used': False, 'blocks': 0}
+            tabs_info.append(info)
+            if ws.sheet_state != 'visible' or not tab_allowed(ws.title):
+                continue
+            rows = [[cell_to_str(c) for c in row] for row in ws.iter_rows(values_only=True)]
+            dh, blocks = parse_schedule_rows(rows, campus=ws.title.strip())
+            info.update(used=True, blocks=len(blocks))
+            if dh and not date_header:
+                date_header = dh
+            all_blocks.extend(blocks)
+
+        return date_header, all_blocks, None, tabs_info
     except Exception as e:
         return None, [], str(e), None
 
@@ -219,8 +402,18 @@ def get_schedule_for_date(target_date):
     key = target_date.strftime('%Y-%m-%d')
     if key in schedule_cache:
         cached = schedule_cache[key]
-        print(f"=== get_schedule_for_date === {key}: из кэша, блоков {len(cached[1])}", flush=True)
+        print(f"=== get_schedule_for_date === {key}: из памяти, блоков {len(cached[1])}", flush=True)
         return cached
+
+    raw = r_get_json(ckey('sch', key))
+    if raw and raw.get('blocks'):
+        try:
+            result = (raw['date_header'], raw['blocks'], dt.date.fromisoformat(raw['actual_date']))
+            schedule_cache[key] = result
+            print(f"=== get_schedule_for_date === {key}: из Redis, блоков {len(result[1])}", flush=True)
+            return result
+        except Exception as e:
+            print(f"=== get_schedule_for_date === битый кэш Redis: {e}", flush=True)
 
     sheets, actual_date = find_sheets_for_date(target_date)
     if not sheets:
@@ -233,7 +426,7 @@ def get_schedule_for_date(target_date):
     date_header = None
 
     for sheet in sheets:
-        dh, blocks, err, raw_head = _download_and_parse(sheet)
+        dh, blocks, err, tabs = _download_and_parse(sheet)
         if err:
             print(f"=== get_schedule_for_date === sheet {sheet['sheet_id'][:12]}… ERROR: {err}", flush=True)
             continue
@@ -246,6 +439,12 @@ def get_schedule_for_date(target_date):
 
     if all_blocks:
         schedule_cache[key] = result
+        r_set_json(
+            ckey('sch', key),
+            {'date_header': date_header, 'blocks': all_blocks,
+             'actual_date': actual_date.isoformat()},
+            SCHEDULE_TTL,
+        )
     else:
         print(f"=== get_schedule_for_date === {key}: блоков 0, НЕ кэширую", flush=True)
 
@@ -317,13 +516,41 @@ def format_day_for_group(date_header, blocks, group_query):
 
         if block_lines:
             has_content = True
-            lines.append(f"👥 Группа {g.strip()}")
+            campus = block.get('campus', '')
+            title = f"👥 Группа {g.strip()}" + (f" · {campus}" if campus else "")
+            lines.append(title)
             lines.extend(block_lines)
 
     if not has_content:
         return f"🔍 По группе «{group_query}» занятий не найдено."
 
     return "\n".join(lines)
+
+
+# --- ВЫБОР ГРУППЫ ПО КОРПУСУ ---
+
+def campus_key(name):
+    # короткий стабильный ключ: название корпуса не влезет в callback_data (≤64 байт)
+    return hashlib.md5(name.encode('utf-8')).hexdigest()[:6]
+
+
+def course_of(g):
+    m = re.search(r'\d', g)
+    return int(m.group(0)) if m else 0
+
+
+def collect_groups():
+    """{корпус: [группы]} по расписанию на сегодня (или ближайшую дату). Порядок — как вкладки."""
+    _, blocks, actual = get_schedule_for_date(today_local())
+    result = {}
+    for b in blocks:
+        campus = b.get('campus') or 'Без корпуса'
+        lst = result.setdefault(campus, [])
+        for g in b['groups']:
+            g = g.strip()
+            if g and g not in lst:
+                lst.append(g)
+    return {c: gs for c, gs in result.items() if gs}, actual
 
 
 # --- КНОПКИ ---
@@ -339,6 +566,47 @@ def main_menu(group):
     kb.add(
         InlineKeyboardButton("👥 Сменить группу", callback_data="change_group"),
     )
+    return kb
+
+
+def pick_button():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🏫 Выбрать из списка", callback_data="pick"))
+    return kb
+
+
+def campus_menu(groups_by_campus):
+    kb = InlineKeyboardMarkup(row_width=1)
+    for campus, groups in groups_by_campus.items():
+        kb.add(InlineKeyboardButton(
+            f"🏫 {campus} ({len(groups)})",
+            callback_data=f"cp|{campus_key(campus)}|0",
+        ))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="change_group"))
+    return kb
+
+
+def groups_menu(groups, key, page=0):
+    ordered = sorted(groups, key=lambda g: (course_of(g), g))
+    pages = max(1, (len(ordered) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    chunk = ordered[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    kb = InlineKeyboardMarkup(row_width=4)
+    buttons = [InlineKeyboardButton(g, callback_data=f"pg|{g[:20]}") for g in chunk]
+    for i in range(0, len(buttons), 4):
+        kb.row(*buttons[i:i + 4])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"cp|{key}|{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f"cp|{key}|{page + 1}"))
+        kb.row(*nav)
+
+    kb.add(InlineKeyboardButton("⬅️ К корпусам", callback_data="pick"))
     return kb
 
 
@@ -401,28 +669,42 @@ def send_or_edit(chat_id, message_id, text, reply_markup=None):
 
 
 def send_fresh(chat_id, text, reply_markup=None):
-    old_id = last_bot_message.pop(chat_id, None)
+    old_id = pop_last_msg(chat_id)
     if old_id:
         safe_delete(chat_id, old_id)
     new_id = send_long(chat_id, text, reply_markup)
-    last_bot_message[chat_id] = new_id
+    set_last_msg(chat_id, new_id)
     return new_id
 
 
 # --- ОБРАБОТЧИКИ ---
 
 def start_message(msg):
-    send_fresh(
-        msg.chat.id,
-        "👋 Привет! Я бот расписания ТСПК.\n\n"
-        "Напиши название своей группы (например, СД-21 или исип41).",
-    )
+    chat_id = msg.chat.id
+    group = get_saved_group(chat_id)
+    if group:
+        send_fresh(
+            chat_id,
+            f"👋 С возвращением! Твоя группа: {group}\n\nВыбери, что показать:",
+            reply_markup=main_menu(group),
+        )
+    else:
+        send_fresh(
+            chat_id,
+            "👋 Привет! Я бот расписания ТСПК.\n\n" + GROUP_PROMPT,
+            reply_markup=pick_button(),
+        )
+
+
+def group_command(msg):
+    send_fresh(msg.chat.id, GROUP_PROMPT, reply_markup=pick_button())
 
 
 def handle_group_input(msg):
     group = (msg.text or '').strip()
     if not group or group.startswith('/'):
         return
+    save_group(msg.chat.id, group)
     send_fresh(
         msg.chat.id,
         f"✅ Группа сохранена: {group}\n\nВыбери, что показать:",
@@ -461,17 +743,53 @@ def handle_callback(call):
     except Exception as e:
         print(f"=== answer_callback_query ERROR === {e}", flush=True)
 
-    if data == 'change_group':
-        new_id = send_or_edit(chat_id, message_id,
-                              "Напиши название своей группы (например, СД-21 или исип41):", None)
-        last_bot_message[chat_id] = new_id
+    def show(text, markup=None):
+        new_id = send_or_edit(chat_id, message_id, text, markup)
+        set_last_msg(chat_id, new_id)
+        return new_id
+
+    if data == 'noop':
         return
 
+    # --- выбор группы ---
+    if data == 'change_group':
+        show(GROUP_PROMPT, pick_button())
+        return
+
+    if data == 'pick':
+        send_or_edit(chat_id, message_id, "⏳ Загружаю список групп...", None)
+        by_campus, _ = collect_groups()
+        if not by_campus:
+            show("😔 Не удалось получить список групп. Напиши группу вручную "
+                 "(например, СД-21).", pick_button())
+            return
+        show("🏫 Выбери корпус:", campus_menu(by_campus))
+        return
+
+    if data.startswith('cp|'):
+        parts = data.split('|')
+        key = parts[1] if len(parts) > 1 else ''
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        by_campus, _ = collect_groups()
+        campus = next((c for c in by_campus if campus_key(c) == key), None)
+        if not campus:
+            show("Список изменился, выбери корпус заново:", campus_menu(by_campus))
+            return
+        show(f"🏫 {campus}\nВыбери группу:", groups_menu(by_campus[campus], key, page))
+        return
+
+    if data.startswith('pg|'):
+        group = data.split('|', 1)[1]
+        save_group(chat_id, group)
+        show(f"✅ Группа выбрана: {group}\n\nВыбери, что показать:", main_menu(group))
+        return
+
+    # --- расписание ---
     if '|' not in data:
         return
 
     action, group = data.split('|', 1)
-    today = dt.date.today()
+    today = today_local()
 
     if action == 'today':
         target, label = today, 'сегодня'
@@ -483,10 +801,8 @@ def handle_callback(call):
         return
 
     send_or_edit(chat_id, message_id, f"⏳ Загружаю расписание на {label}...", None)
-
     text = build_schedule_text(group, target, label)
-    new_id = send_or_edit(chat_id, message_id, text, main_menu(group))
-    last_bot_message[chat_id] = new_id
+    show(text, main_menu(group))
 
 
 # --- WEBHOOK ---
@@ -509,8 +825,19 @@ def debug_links():
     return jsonify({
         'total_links': len(links),
         'with_date': sum(1 for l in links if l['date']),
+        'today_samara': today_local().isoformat(),
         'by_date': {k: by_date[k] for k in dates_sorted},
     })
+
+
+@app.route('/debug/redis', methods=['GET'])
+def debug_redis():
+    out = {'enabled': redis is not None}
+    if redis:
+        key = ckey('debug', 'ping')
+        out['write_ok'] = r_set(key, 'pong', 30)
+        out['read'] = r_get(key)
+    return jsonify(out)
 
 
 @app.route('/debug/day/<date_str>', methods=['GET'])
@@ -529,7 +856,7 @@ def debug_day(date_str):
     }
 
     for sheet in sheets:
-        dh, blocks, err, raw_head = _download_and_parse(sheet)
+        dh, blocks, err, tabs = _download_and_parse(sheet)
         sheet_info = {
             'sheet_id': sheet['sheet_id'],
             'sheet_date': sheet['date'].isoformat() if sheet['date'] else None,
@@ -537,11 +864,13 @@ def debug_day(date_str):
             'date_header': dh,
             'blocks_count': len(blocks),
             'error': err,
-            'raw_head': raw_head,
+            'tabs': tabs,
             'groups_sample': [],
         }
         for b in blocks[:3]:
-            sheet_info['groups_sample'].append(b['groups'][:10])
+            sheet_info['groups_sample'].append(
+                {'campus': b.get('campus'), 'groups': b['groups'][:10]}
+            )
         out['sheets'].append(sheet_info)
 
     return jsonify(out)
@@ -559,6 +888,8 @@ def webhook():
             print(f"=== WEBHOOK === message: {text[:60]}", flush=True)
             if text == '/start':
                 start_message(msg)
+            elif text == '/group':
+                group_command(msg)
             else:
                 handle_group_input(msg)
 

@@ -1,6 +1,8 @@
-flask
+Flask
 pyTelegramBotAPI
 requests
-pandas
-cachetools
 beautifulsoup4
+cachetools
+openpyxl
+upstash-redis
+tzdata
