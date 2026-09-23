@@ -20,7 +20,7 @@ print("=== BOOT === Токен загружен", flush=True)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 telebot.apihelper.CONNECT_TIMEOUT = 5
-telebot.apihelper.READ_TIMEOUT = 10
+telebot.apihelper.READ_TIMEOUT = 15
 
 app = Flask(__name__)
 
@@ -116,18 +116,12 @@ def extract_sheet_links():
 
 
 def get_available_dates():
-    """Возвращает отсортированный список дат, для которых есть расписание."""
     links = extract_sheet_links()
     dates = sorted(set(l['date'] for l in links if l['date']))
     return dates
 
 
 def find_sheets_for_date(target_date):
-    """
-    Возвращает (список_ссылок, фактическая_дата).
-    Сначала ищет точное совпадение, потом — ближайшую дату в любую сторону
-    (не дальше 3 дней). Для прошедших дат fallback тоже идёт в прошлое.
-    """
     links = extract_sheet_links()
     matching = [l for l in links if l['date'] == target_date]
     if matching:
@@ -135,17 +129,12 @@ def find_sheets_for_date(target_date):
 
     dated = [l for l in links if l['date']]
     if not dated:
-        print("=== find_sheets_for_date === ни одной даты не извлечено", flush=True)
         return [], target_date
-
-    available = sorted(set(l['date'] for l in dated))
-    print(f"=== find_sheets_for_date === target={target_date}, available={[d.isoformat() for d in available]}", flush=True)
 
     nearest = min(dated, key=lambda l: abs((l['date'] - target_date).days))
     delta = abs((nearest['date'] - target_date).days)
 
     if delta <= 3:
-        # Все ссылки на найденную дату
         actual = nearest['date']
         return [l for l in dated if l['date'] == actual], actual
 
@@ -191,33 +180,60 @@ def parse_schedule_csv(text):
     return date_header, blocks
 
 
+def _download_and_parse(sheet):
+    """Скачивает один CSV и возвращает (date_header, blocks, error, raw_head)."""
+    url = f'https://docs.google.com/spreadsheets/d/{sheet["sheet_id"]}/export?format=csv'
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        text = r.text
+        dh, blocks = parse_schedule_csv(text)
+        return dh, blocks, None, text[:300]
+    except Exception as e:
+        return None, [], str(e), None
+
+
 def get_schedule_for_date(target_date):
+    """
+    Возвращает (date_header, all_blocks, actual_date).
+    Пустые результаты НЕ кэшируются — иначе один неудачный запрос
+    блокирует день на 30 минут.
+    """
     key = target_date.strftime('%Y-%m-%d')
     if key in schedule_cache:
-        return schedule_cache[key]
+        cached = schedule_cache[key]
+        print(f"=== get_schedule_for_date === {key}: из кэша, блоков {len(cached[1])}", flush=True)
+        return cached
 
     sheets, actual_date = find_sheets_for_date(target_date)
     if not sheets:
+        print(f"=== get_schedule_for_date === {key}: нет ссылок", flush=True)
         return None, [], target_date
+
+    print(f"=== get_schedule_for_date === {key}: найдено {len(sheets)} ссылок, качаю...", flush=True)
 
     all_blocks = []
     date_header = None
 
     for sheet in sheets:
-        url = f'https://docs.google.com/spreadsheets/d/{sheet["sheet_id"]}/export?format=csv'
-        try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            dh, blocks = parse_schedule_csv(r.text)
-            if dh and not date_header:
-                date_header = dh
-            all_blocks.extend(blocks)
-            print(f"=== get_schedule_for_date === {sheet['sheet_id'][:12]}… ({sheet['date']}) → блоков {len(blocks)}", flush=True)
-        except Exception as e:
-            print(f"=== get_schedule_for_date ERROR === {sheet['sheet_id'][:12]}: {e}", flush=True)
+        dh, blocks, err, raw_head = _download_and_parse(sheet)
+        if err:
+            print(f"=== get_schedule_for_date === sheet {sheet['sheet_id'][:12]}… ERROR: {err}", flush=True)
+            continue
+        if dh and not date_header:
+            date_header = dh
+        all_blocks.extend(blocks)
+        print(f"=== get_schedule_for_date === sheet {sheet['sheet_id'][:12]}… ({sheet['date']}) → блоков {len(blocks)}, head='{(raw_head or '')[:80]}'", flush=True)
 
-    schedule_cache[key] = (date_header, all_blocks, actual_date)
-    return date_header, all_blocks, actual_date
+    result = (date_header, all_blocks, actual_date)
+
+    # Кэшируем только успешный результат
+    if all_blocks:
+        schedule_cache[key] = result
+    else:
+        print(f"=== get_schedule_for_date === {key}: блоков 0, НЕ кэширую", flush=True)
+
+    return result
 
 
 # --- ФОРМАТИРОВАНИЕ И ПОИСК ГРУППЫ ---
@@ -252,7 +268,17 @@ def find_group(blocks, query):
 def format_day_for_group(date_header, blocks, group_query):
     matches = find_group(blocks, group_query)
     if not matches:
-        return f"🔍 Группа «{group_query}» не найдена в расписании на этот день."
+        # Подсказка: какие группы вообще есть
+        all_groups = set()
+        for b in blocks:
+            for g in b['groups']:
+                if g.strip():
+                    all_groups.add(g.strip())
+        hint = ''
+        if all_groups:
+            sample = ', '.join(sorted(all_groups)[:20])
+            hint = f"\n\n📋 Группы в таблице: {sample}"
+        return f"🔍 Группа «{group_query}» не найдена в расписании на этот день.{hint}"
 
     lines = []
     if date_header:
@@ -390,22 +416,18 @@ def handle_group_input(msg):
 
 
 def build_schedule_text(group, target_date, label):
-    """Возвращает готовый текст. Если даты нет — информативное сообщение."""
     date_header, blocks, actual_date = get_schedule_for_date(target_date)
 
     if not blocks:
-        available = get_available_dates()
-        if available:
-            avail_str = ', '.join(d.strftime('%d.%m') for d in available[:15])
-            return (
-                f"😔 На {label} ({target_date.strftime('%d.%m.%Y')}) расписания нет.\n\n"
-                f"📌 Доступные даты: {avail_str}"
-            )
-        return f"😔 Не удалось найти расписание на {target_date.strftime('%d.%m.%Y')}."
+        return (
+            f"😔 На {label} ({target_date.strftime('%d.%m.%Y')}) расписания нет.\n\n"
+            f"Возможные причины:\n"
+            f"• на сайте нет ссылки на этот день\n"
+            f"• таблица скачалась, но не распозналась"
+        )
 
     text = format_day_for_group(date_header, blocks, group)
 
-    # Если дата не совпала с запрошенной — предупредим пользователя
     if actual_date != target_date:
         text = (
             f"ℹ️ На {target_date.strftime('%d.%m.%Y')} расписания нет, "
@@ -476,19 +498,39 @@ def debug_links():
     })
 
 
-@app.route('/debug/yesterday', methods=['GET'])
-def debug_yesterday():
-    """Что бот думает про вчера."""
-    target = dt.date.today() - dt.timedelta(days=1)
-    sheets, actual = find_sheets_for_date(target)
-    available = get_available_dates()
-    return jsonify({
-        'today': dt.date.today().isoformat(),
-        'target_yesterday': target.isoformat(),
+@app.route('/debug/day/<date_str>', methods=['GET'])
+def debug_day(date_str):
+    """Показать, что именно скачивается и парсится для конкретной даты."""
+    try:
+        target = dt.datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'error': 'expected YYYY-MM-DD'}), 400
+
+    sheets, actual_date = find_sheets_for_date(target)
+    out = {
+        'target': target.isoformat(),
         'found_sheets': len(sheets),
-        'actual_date': actual.isoformat() if actual else None,
-        'available_dates': [d.isoformat() for d in available],
-    })
+        'actual_date': actual_date.isoformat() if actual_date else None,
+        'sheets': [],
+    }
+
+    for sheet in sheets:
+        dh, blocks, err, raw_head = _download_and_parse(sheet)
+        sheet_info = {
+            'sheet_id': sheet['sheet_id'],
+            'sheet_date': sheet['date'].isoformat() if sheet['date'] else None,
+            'anchor': sheet['anchor'][:60],
+            'date_header': dh,
+            'blocks_count': len(blocks),
+            'error': err,
+            'raw_head': raw_head,
+            'groups_sample': [],
+        }
+        for b in blocks[:3]:
+            sheet_info['groups_sample'].append(b['groups'][:10])
+        out['sheets'].append(sheet_info)
+
+    return jsonify(out)
 
 
 @app.route('/', methods=['POST'])
