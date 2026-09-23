@@ -115,16 +115,39 @@ def extract_sheet_links():
     return links
 
 
+def get_available_dates():
+    """Возвращает отсортированный список дат, для которых есть расписание."""
+    links = extract_sheet_links()
+    dates = sorted(set(l['date'] for l in links if l['date']))
+    return dates
+
+
 def find_sheets_for_date(target_date):
+    """
+    Возвращает (список_ссылок, фактическая_дата).
+    Сначала ищет точное совпадение, потом — ближайшую дату в любую сторону
+    (не дальше 3 дней). Для прошедших дат fallback тоже идёт в прошлое.
+    """
     links = extract_sheet_links()
     matching = [l for l in links if l['date'] == target_date]
     if matching:
         return matching, target_date
 
-    future = [l for l in links if l['date'] and l['date'] >= target_date]
-    if future:
-        nearest = min(l['date'] for l in future)
-        return [l for l in future if l['date'] == nearest], nearest
+    dated = [l for l in links if l['date']]
+    if not dated:
+        print("=== find_sheets_for_date === ни одной даты не извлечено", flush=True)
+        return [], target_date
+
+    available = sorted(set(l['date'] for l in dated))
+    print(f"=== find_sheets_for_date === target={target_date}, available={[d.isoformat() for d in available]}", flush=True)
+
+    nearest = min(dated, key=lambda l: abs((l['date'] - target_date).days))
+    delta = abs((nearest['date'] - target_date).days)
+
+    if delta <= 3:
+        # Все ссылки на найденную дату
+        actual = nearest['date']
+        return [l for l in dated if l['date'] == actual], actual
 
     return [], target_date
 
@@ -175,8 +198,7 @@ def get_schedule_for_date(target_date):
 
     sheets, actual_date = find_sheets_for_date(target_date)
     if not sheets:
-        print(f"=== get_schedule_for_date === нет ссылок на {target_date}", flush=True)
-        return None, []
+        return None, [], target_date
 
     all_blocks = []
     date_header = None
@@ -194,29 +216,23 @@ def get_schedule_for_date(target_date):
         except Exception as e:
             print(f"=== get_schedule_for_date ERROR === {sheet['sheet_id'][:12]}: {e}", flush=True)
 
-    schedule_cache[key] = (date_header, all_blocks)
-    return date_header, all_blocks
+    schedule_cache[key] = (date_header, all_blocks, actual_date)
+    return date_header, all_blocks, actual_date
 
 
 # --- ФОРМАТИРОВАНИЕ И ПОИСК ГРУППЫ ---
 
 def normalize(s):
-    """
-    Убираем ВСЁ, кроме букв и цифр, приводим к верхнему регистру.
-    'исип41', 'ИСИП 41', 'исип-41', 'ИСиП-41 ' → 'ИСИП41'
-    """
     if not s:
         return ''
     return re.sub(r'[^0-9A-Za-zА-Яа-яЁё]', '', s).upper()
 
 
 def find_group(blocks, query):
-    """Ищет группу в блоках, используя нормализованное сравнение."""
     q = normalize(query)
     if not q:
         return []
 
-    # 1) Точное совпадение по нормализованной форме
     exact = []
     for bi, block in enumerate(blocks):
         for g in block['groups']:
@@ -225,7 +241,6 @@ def find_group(blocks, query):
     if exact:
         return exact
 
-    # 2) Частичное совпадение (нормализованная подстрока)
     partial = []
     for bi, block in enumerate(blocks):
         for g in block['groups']:
@@ -273,8 +288,6 @@ def format_day_for_group(date_header, blocks, group_query):
 # --- КНОПКИ ---
 
 def main_menu(group):
-    # callback_data ограничен 64 байтами; кириллица = 2 байта/символ.
-    # "yesterday|" = 10 байт, значит группа — не больше 20 символов.
     g = group.strip()[:20]
     kb = InlineKeyboardMarkup(row_width=3)
     kb.add(
@@ -361,8 +374,7 @@ def start_message(msg):
     send_fresh(
         msg.chat.id,
         "👋 Привет! Я бот расписания ТСПК.\n\n"
-        "Напиши название своей группы (например, СД-21 или исип41) — "
-        "и я покажу кнопки для быстрого доступа.",
+        "Напиши название своей группы (например, СД-21 или исип41).",
     )
 
 
@@ -377,12 +389,36 @@ def handle_group_input(msg):
     )
 
 
+def build_schedule_text(group, target_date, label):
+    """Возвращает готовый текст. Если даты нет — информативное сообщение."""
+    date_header, blocks, actual_date = get_schedule_for_date(target_date)
+
+    if not blocks:
+        available = get_available_dates()
+        if available:
+            avail_str = ', '.join(d.strftime('%d.%m') for d in available[:15])
+            return (
+                f"😔 На {label} ({target_date.strftime('%d.%m.%Y')}) расписания нет.\n\n"
+                f"📌 Доступные даты: {avail_str}"
+            )
+        return f"😔 Не удалось найти расписание на {target_date.strftime('%d.%m.%Y')}."
+
+    text = format_day_for_group(date_header, blocks, group)
+
+    # Если дата не совпала с запрошенной — предупредим пользователя
+    if actual_date != target_date:
+        text = (
+            f"ℹ️ На {target_date.strftime('%d.%m.%Y')} расписания нет, "
+            f"показываю ближайшее: {actual_date.strftime('%d.%m.%Y')}\n\n" + text
+        )
+    return text
+
+
 def handle_callback(call):
     chat_id = call.message.chat.id
     message_id = call.message.message_id
     data = call.data or ''
 
-    # Мгновенно отвечаем на callback, чтобы Telegram не показывал «бот не отвечает»
     try:
         bot.answer_callback_query(call.id)
     except Exception as e:
@@ -411,12 +447,7 @@ def handle_callback(call):
 
     send_or_edit(chat_id, message_id, f"⏳ Загружаю расписание на {label}...", None)
 
-    date_header, blocks = get_schedule_for_date(target)
-    if not blocks:
-        text = f"😔 Не нашёл расписание на {target.strftime('%d.%m.%Y')}."
-    else:
-        text = format_day_for_group(date_header, blocks, group)
-
+    text = build_schedule_text(group, target, label)
     new_id = send_or_edit(chat_id, message_id, text, main_menu(group))
     last_bot_message[chat_id] = new_id
 
@@ -442,6 +473,21 @@ def debug_links():
         'total_links': len(links),
         'with_date': sum(1 for l in links if l['date']),
         'by_date': {k: by_date[k] for k in dates_sorted},
+    })
+
+
+@app.route('/debug/yesterday', methods=['GET'])
+def debug_yesterday():
+    """Что бот думает про вчера."""
+    target = dt.date.today() - dt.timedelta(days=1)
+    sheets, actual = find_sheets_for_date(target)
+    available = get_available_dates()
+    return jsonify({
+        'today': dt.date.today().isoformat(),
+        'target_yesterday': target.isoformat(),
+        'found_sheets': len(sheets),
+        'actual_date': actual.isoformat() if actual else None,
+        'available_dates': [d.isoformat() for d in available],
     })
 
 
