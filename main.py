@@ -27,7 +27,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения.")
 
-BUILD = '2026-09-24-html-cards'  # метка версии: видна на GET / и в логах при старте
+BUILD = '2026-09-24-html-cards-2'  # метка версии: видна на GET / и в логах при старте
 
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
 DEBUG_KEY = os.getenv('DEBUG_KEY')
@@ -686,8 +686,19 @@ def split_cell(cell):
     return [cell or '']
 
 
+def _same_clock(a, b):
+    def n(t):
+        h, m = re.split(r'[.:]', t)
+        return int(h), int(m)
+    try:
+        return n(a) == n(b)
+    except ValueError:
+        return False
+
+
 def render_lesson(pair, time_raw, cell, highlight=None, prefix_lines=None):
     segs = split_cell(cell)
+    row_times = re.findall(r'\d{1,2}[.:]\d{2}', time_raw or '')
     if highlight and len(segs) > 1:
         mine = [x for x in segs if highlight in extract_teachers(x)]
         segs = mine or segs
@@ -696,6 +707,9 @@ def render_lesson(pair, time_raw, cell, highlight=None, prefix_lines=None):
     lines = []
     for i, seg in enumerate(segs):
         p = parse_cell(seg)
+        # «12.25» в начале ячейки, совпадающее с началом пары, — не «позднее начало»
+        if p['start'] and row_times and _same_clock(p['start'], row_times[0]):
+            p['start'] = None
         flags = []
         if p['start']:
             flags.append(f"⏰ с {esc(p['start'].replace('.', ':'))}")
