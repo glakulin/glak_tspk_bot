@@ -25,11 +25,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения.")
 
-# FIX: секрет вебхука. Если задать переменную WEBHOOK_SECRET, POST-запросы
-# без правильного заголовка X-Telegram-Bot-Api-Secret-Token отклоняются (403).
-# При регистрации вебхука передать тот же secret_token. Не задан — как раньше.
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
-# FIX: если задать DEBUG_KEY, /debug* открываются только с ?key=DEBUG_KEY
 DEBUG_KEY = os.getenv('DEBUG_KEY')
 
 print(f"=== BOOT === Токен загружен | webhook_secret: {'да' if WEBHOOK_SECRET else 'нет'}"
@@ -56,27 +52,31 @@ def today_local():
 
 # Кэш в памяти (живёт, пока «тёплый» инстанс) + Redis (общий между вызовами)
 SCHEDULE_TTL = 1800
-NEG_TTL = 300         # FIX: короткий негативный кэш «расписания нет» — не долбим Google
+NEG_TTL = 300         # короткий негативный кэш «расписания нет»
 LINKS_TTL = 600
 LASTMSG_TTL = 172800  # 48 ч: старее Telegram всё равно не даёт удалять
 STATE_TTL = 600
-CACHE_VERSION = 'v3'  # FIX: поднял версию — изменилась склейка дублей групп в blocks
-PAGE_SIZE = 40  # групп на страницу (лимит Telegram — 100 кнопок)
-INCLUDE_HIDDEN_TABS = os.getenv('INCLUDE_HIDDEN_TABS') == '1'  # читать и скрытые вкладки
+CACHE_VERSION = 'v3'
+PAGE_SIZE = 40
+INCLUDE_HIDDEN_TABS = os.getenv('INCLUDE_HIDDEN_TABS') == '1'
 
 schedule_cache = TTLCache(maxsize=30, ttl=SCHEDULE_TTL)
-neg_schedule_cache = TTLCache(maxsize=30, ttl=NEG_TTL)  # FIX: отдельный кэш «пусто»
+neg_schedule_cache = TTLCache(maxsize=30, ttl=NEG_TTL)
 links_cache = TTLCache(maxsize=1, ttl=LINKS_TTL)
 
-# FIX: раньше были безразмерные dict — теперь сами очищаются
 last_bot_message = TTLCache(maxsize=5000, ttl=LASTMSG_TTL)
 chat_state = TTLCache(maxsize=5000, ttl=STATE_TTL + 60)
 
-# FIX: дедупликация апдейтов — Telegram может прислать один апдейт дважды,
-# если обработка заняла больше его таймаута
 seen_updates = TTLCache(maxsize=10000, ttl=300)
 
 DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
+
+# NEW: команды-дни
+DAY_COMMANDS = {
+    '/yesterday': (-1, 'вчера'),
+    '/today': (0, 'сегодня'),
+    '/tomorrow': (1, 'завтра'),
+}
 
 MONTHS_RU = [
     ('январ', 1), ('феврал', 2), ('март', 3), ('апрел', 4),
@@ -86,6 +86,26 @@ MONTHS_RU = [
 
 GROUP_PROMPT = ("Напиши название своей группы (например, СД-21 или исип41) "
                 "или выбери из списка:")
+
+
+# NEW: меню команд Telegram (видно при вводе «/» в чате).
+# Идемпотентно: при нескольких воркерах просто перезапишется тем же.
+def register_bot_commands():
+    try:
+        bot.set_my_commands([
+            telebot.types.BotCommand('start', 'Запустить бота'),
+            telebot.types.BotCommand('today', 'Расписание на сегодня'),
+            telebot.types.BotCommand('tomorrow', 'Расписание на завтра'),
+            telebot.types.BotCommand('yesterday', 'Расписание на вчера'),
+            telebot.types.BotCommand('group', 'Сменить группу'),
+            telebot.types.BotCommand('teacher', 'Найти преподавателя'),
+        ])
+        print("=== BOOT === меню команд установлено", flush=True)
+    except Exception as e:
+        print(f"=== BOOT === set_my_commands не удалось (не критично): {e}", flush=True)
+
+
+register_bot_commands()
 
 
 # --- REDIS ---
@@ -174,10 +194,7 @@ def save_group(chat_id, group):
     r_set(f"tspk:group:{chat_id}", group)
 
 
-# id последних сообщений бота (для режима «одно сообщение»)
-# FIX: теперь хранится СПИСОК id — длинные ответы из нескольких сообщений
-# удаляются целиком, а не только последняя часть.
-
+# id последних сообщений бота (список — для длинных ответов)
 def get_last_msg(chat_id):
     v = last_bot_message.get(chat_id)
     if v is None:
@@ -193,7 +210,6 @@ def get_last_msg(chat_id):
     try:
         parsed = json.loads(s)
     except ValueError:
-        # старый формат: просто число строкой
         return [int(s)] if s.lstrip('-').isdigit() else []
     if isinstance(parsed, list):
         return [int(x) for x in parsed if str(x).strip().lstrip('-').isdigit()]
@@ -361,15 +377,21 @@ def find_sheets_for_date(target_date):
     return [], target_date
 
 
+# NEW: ближайшая дата СТРОГО позже указанной, для которой на сайте есть таблица.
+# Дёшево: список дат уже в кэше (использовался при поиске ссылок).
+def next_schedule_date(from_date):
+    try:
+        dates = get_available_dates()
+    except Exception as e:
+        print(f"=== next_schedule_date === ERROR: {e}", flush=True)
+        return None
+    later = [d for d in dates if d > from_date]
+    return later[0] if later else None
+
+
 # --- ОЧИСТКА НАЗВАНИЙ ГРУПП ---
 
 def clean_group_name(g):
-    """
-    Оставляет только название группы в начале строки:
-    буквы + (дефис или пробел)? + цифры.
-    'ИСиП-41 2 смена' → 'ИСиП-41'
-    'НК-21 (1 смена)' → 'НК-21'
-    """
     if not g:
         return g
     g = g.strip()
@@ -379,7 +401,7 @@ def clean_group_name(g):
     return g
 
 
-# --- ПАРСИНГ XLSX (все вкладки: корпуса, заочное и т.д.) ---
+# --- ПАРСИНГ XLSX ---
 
 def cell_to_str(v):
     if v is None:
@@ -390,7 +412,6 @@ def cell_to_str(v):
 
 
 def tab_allowed(title):
-    """Сейчас берутся все видимые вкладки. Чтобы исключить какую-то — вернуть False."""
     return True
 
 
@@ -398,7 +419,7 @@ def parse_schedule_rows(rows, campus=''):
     date_header = None
     blocks = []
     current = None
-    col_groups = []  # имя группы для каждой колонки (с возможными дублями)
+    col_groups = []
 
     for row in rows:
         if not row or not any(c.strip() for c in row):
@@ -411,11 +432,6 @@ def parse_schedule_rows(rows, campus=''):
             raw_groups = [c.strip() for c in row[2:]]
             while raw_groups and not raw_groups[-1]:
                 raw_groups.pop()
-            # FIX: если две колонки после чистки дали одно имя
-            # («ИСиП-41 1 смена» и «ИСиП-41 2 смена» → «ИСиП-41»),
-            # раньше вторая молча перезаписывала первую и занятия терялись.
-            # Теперь содержимое таких колонок склеивается через \n,
-            # а в списке групп имя остаётся в единственном экземпляре.
             col_groups = [clean_group_name(g) for g in raw_groups]
             groups = []
             for g in col_groups:
@@ -449,10 +465,6 @@ def parse_schedule_rows(rows, campus=''):
 
 
 def _download_and_parse(sheet):
-    """
-    Скачивает xlsx (все вкладки в одном файле) и парсит каждую видимую вкладку.
-    Возвращает (date_header, blocks, error, tabs_info).
-    """
     url = f'https://docs.google.com/spreadsheets/d/{sheet["sheet_id"]}/export?format=xlsx'
     try:
         r = requests.get(url, timeout=25)
@@ -484,7 +496,6 @@ def get_schedule_for_date(target_date):
         print(f"=== get_schedule_for_date === {key}: из памяти, блоков {len(cached[1])}", flush=True)
         return cached
 
-    # FIX: негативный кэш — не качаем xlsx повторно, если расписания точно нет
     if key in neg_schedule_cache:
         cached = neg_schedule_cache[key]
         print(f"=== get_schedule_for_date === {key}: из памяти (пусто)", flush=True)
@@ -541,7 +552,6 @@ def get_schedule_for_date(target_date):
             SCHEDULE_TTL,
         )
     else:
-        # FIX: пустой результат тоже кэшируем (коротко), чтобы не качать xlsx на каждый запрос
         print(f"=== get_schedule_for_date === {key}: блоков 0, кэширую на {NEG_TTL} с", flush=True)
         neg_schedule_cache[key] = result
         r_set_json(ckey('sch', key),
@@ -628,11 +638,32 @@ def format_day_for_group(date_header, blocks, group_query):
     return "\n".join(lines)
 
 
+# NEW: единая точка построения текста расписания.
+# Возвращает (text, shown_date), где shown_date — дата фактически показанного
+# расписания (или target, если расписания нет). Нужна для кнопки «Следующий день».
+def schedule_text_for(group, target, label):
+    date_header, blocks, actual = get_schedule_for_date(target)
+
+    if not blocks:
+        return (
+            f"😔 На {label} ({target.strftime('%d.%m.%Y')}) расписания нет.\n\n"
+            f"Возможные причины:\n"
+            f"• на сайте нет ссылки на этот день\n"
+            f"• таблица скачалась, но не распозналась"
+        ), target
+
+    text = format_day_for_group(date_header, blocks, group)
+    if actual != target:
+        text = (
+            f"ℹ️ На {target.strftime('%d.%m.%Y')} расписания нет, "
+            f"показываю ближайшее: {actual.strftime('%d.%m.%Y')}\n\n" + text
+        )
+    return text, actual
+
+
 # --- ПОИСК ПРЕПОДАВАТЕЛЯ ---
 
-# «Фамилия И.О.» (с дефисом в фамилии, инициалы с пробелом или без)
 TEACHER_RE = re.compile(r'([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)\s+([А-ЯЁ])\.\s?([А-ЯЁ])\.')
-# FIX: второй формат — «И.О. Фамилия»
 TEACHER_RE_REVERSED = re.compile(r'([А-ЯЁ])\.\s?([А-ЯЁ])\.\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)')
 MAX_TEACHERS_SHOWN = 6
 TEACHER_PROMPT = ("👨‍🏫 Введи фамилию преподавателя (например, Шаров или Шаров С.А.).\n"
@@ -640,7 +671,6 @@ TEACHER_PROMPT = ("👨‍🏫 Введи фамилию преподавате�
 
 
 def trunc_bytes(s, max_bytes):
-    """Обрезка по байтам: callback_data ≤ 64 байт, кириллица = 2 байта на букву."""
     return s.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
 
 
@@ -666,7 +696,6 @@ def extract_teachers(cell):
 
 
 def index_teachers(blocks):
-    """{'Шаров С.А.': [{pair, time, group, campus, text}, ...]}"""
     idx = {}
     for b in blocks:
         campus = b.get('campus', '')
@@ -685,7 +714,6 @@ def index_teachers(blocks):
 
 
 def find_teachers(idx, query):
-    """Сначала точная фамилия/ФИО, потом начало, потом вхождение."""
     q = norm_t(query)
     if len(q) < 3:
         return []
@@ -755,7 +783,6 @@ def build_teacher_text(query, target_date, label):
 
 
 def teacher_menu(query):
-    # FIX: запас по байтам увеличен (64 - префикс "td|-1|" = 6 байт)
     q = trunc_bytes(clean_query(query), 45)
     kb = InlineKeyboardMarkup(row_width=3)
     kb.add(
@@ -777,7 +804,6 @@ def teacher_prompt_menu():
 # --- ВЫБОР ГРУППЫ ПО КОРПУСУ ---
 
 def campus_key(name):
-    # короткий стабильный ключ: название корпуса не влезет в callback_data (≤64 байт)
     return hashlib.md5(name.encode('utf-8')).hexdigest()[:6]
 
 
@@ -787,11 +813,8 @@ def course_of(g):
 
 
 def collect_groups():
-    """{корпус: [группы]} по расписанию на сегодня (или ближайшую дату). Порядок — как вкладки."""
     _, blocks, actual = get_schedule_for_date(today_local())
 
-    # FIX: в длинные праздники рядом может не быть расписания —
-    # пробуем ближайшие даты, по которым вообще есть таблицы
     if not blocks:
         try:
             dates = get_available_dates()
@@ -819,15 +842,23 @@ def collect_groups():
 
 # --- КНОПКИ ---
 
-def main_menu(group):
-    # FIX: было 40 — увеличен запас (64 байта минус "yesterday|" = 10)
-    g = trunc_bytes(group.strip(), 50)
+# NEW: показанному расписанию соответствует shown_date — от неё считается
+# кнопка «➡️ Следующий день». Callback: nd|{дата}|{группа} — 3+10+1+45 ≤ 64 байт.
+def main_menu(group, shown_date=None):
+    g = trunc_bytes(group.strip(), 45)
     kb = InlineKeyboardMarkup(row_width=3)
     kb.add(
         InlineKeyboardButton("📅 Вчера", callback_data=f"yesterday|{g}"),
         InlineKeyboardButton("📅 Сегодня", callback_data=f"today|{g}"),
         InlineKeyboardButton("📅 Завтра", callback_data=f"tomorrow|{g}"),
     )
+    if shown_date:
+        nxt = next_schedule_date(shown_date)
+        if nxt:
+            kb.add(InlineKeyboardButton(
+                f"➡️ {DAY_NAMES[nxt.weekday()]}, {nxt.strftime('%d.%m')}",
+                callback_data=f"nd|{nxt.isoformat()}|{g}",
+            ))
     kb.add(
         InlineKeyboardButton("👥 Сменить группу", callback_data="change_group"),
         InlineKeyboardButton("👨‍🏫 Преподаватель", callback_data="tsearch"),
@@ -859,7 +890,6 @@ def groups_menu(groups, key, page=0):
     chunk = ordered[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
     kb = InlineKeyboardMarkup(row_width=4)
-    # FIX: раньше g[:20] мог обрезать длинное имя группы — теперь лимит по байтам (3+60 ≤ 64)
     buttons = [InlineKeyboardButton(g, callback_data=f"pg|{trunc_bytes(g, 60)}") for g in chunk]
     for i in range(0, len(buttons), 4):
         kb.row(*buttons[i:i + 4])
@@ -901,7 +931,6 @@ def safe_edit(chat_id, message_id, text, reply_markup=None):
 
 
 def send_long(chat_id, text, reply_markup=None):
-    """FIX: возвращает список id всех отправленных сообщений (не только последнего)."""
     MAX = 4000
     if len(text) <= MAX:
         sent = bot.send_message(chat_id, text, reply_markup=reply_markup, timeout=10)
@@ -926,7 +955,6 @@ def send_long(chat_id, text, reply_markup=None):
 
 
 def send_fresh(chat_id, text, reply_markup=None):
-    # FIX: удаляем ВСЕ части прошлого ответа, а не только последнюю
     for mid in pop_last_msg(chat_id):
         safe_delete(chat_id, mid)
     new_ids = send_long(chat_id, text, reply_markup)
@@ -934,10 +962,20 @@ def send_fresh(chat_id, text, reply_markup=None):
     return new_ids[-1] if new_ids else None
 
 
+# NEW: заменяет последний ответ бота (например, «⏳») на готовый текст
+# редактированием; если не вышло (длинный текст) — удаляет и шлёт заново.
+def replace_fresh(chat_id, text, reply_markup=None):
+    ids = get_last_msg(chat_id)
+    if ids and len(text) <= 4000 and safe_edit(chat_id, ids[-1], text, reply_markup):
+        for mid in ids[:-1]:
+            safe_delete(chat_id, mid)
+        set_last_msg(chat_id, [ids[-1]])
+        return ids[-1]
+    return send_fresh(chat_id, text, reply_markup)
+
+
 # --- ВАЛИДАЦИЯ ВВОДА ГРУППЫ ---
 
-# FIX: у реальных групп всегда есть цифра (номер курса/группы),
-# поэтому «спасибо» больше не сохранится как группа
 GROUP_INPUT_RE = re.compile(r'^[0-9A-Za-zА-Яа-яЁё][0-9A-Za-zА-Яа-яЁё \-/.]{0,29}$')
 
 
@@ -972,9 +1010,24 @@ def group_command(msg):
     send_fresh(msg.chat.id, GROUP_PROMPT, reply_markup=pick_button())
 
 
+# NEW: /today, /tomorrow, /yesterday — по группе, сохранённой для chat_id
+# (работают и в личке, и в групповом чате, куда бот добавлен).
+def day_command(msg, cmd):
+    chat_id = msg.chat.id
+    clear_state(chat_id)
+    group = get_saved_group(chat_id)
+    if not group:
+        send_fresh(chat_id, GROUP_PROMPT, reply_markup=pick_button())
+        return
+    offset, label = DAY_COMMANDS[cmd]
+    target = today_local() + dt.timedelta(days=offset)
+    send_fresh(chat_id, f"⏳ Загружаю расписание на {label}...", None)
+    text, shown = schedule_text_for(group, target, label)
+    replace_fresh(chat_id, text, main_menu(group, shown))
+
+
 def handle_group_input(msg):
     chat_id = msg.chat.id
-    # FIX: чистим ввод (если юзер скопировал «НК-21 (1 смена)» — останется «НК-21»)
     group = clean_group_name((msg.text or '').strip())
     if not group or group.startswith('/'):
         return
@@ -1020,34 +1073,12 @@ def teacher_command(msg, arg):
         send_fresh(chat_id, TEACHER_PROMPT, reply_markup=teacher_prompt_menu())
 
 
-def build_schedule_text(group, target_date, label):
-    date_header, blocks, actual_date = get_schedule_for_date(target_date)
-
-    if not blocks:
-        return (
-            f"😔 На {label} ({target_date.strftime('%d.%m.%Y')}) расписания нет.\n\n"
-            f"Возможные причины:\n"
-            f"• на сайте нет ссылки на этот день\n"
-            f"• таблица скачалась, но не распозналась"
-        )
-
-    text = format_day_for_group(date_header, blocks, group)
-
-    if actual_date != target_date:
-        text = (
-            f"ℹ️ На {target_date.strftime('%d.%m.%Y')} расписания нет, "
-            f"показываю ближайшее: {actual_date.strftime('%d.%m.%Y')}\n\n" + text
-        )
-    return text
-
-
 def handle_callback(call):
     try:
         bot.answer_callback_query(call.id)
     except Exception as e:
         print(f"=== answer_callback_query ERROR === {e}", flush=True)
 
-    # FIX: у апдейтов из inline-режима может не быть message — раньше падало
     if not call.message or not call.message.chat:
         print("=== handle_callback === нет call.message, игнорирую", flush=True)
         return
@@ -1058,11 +1089,10 @@ def handle_callback(call):
 
     def show(text, markup=None):
         try:
-            ids = list(get_last_msg(chat_id))  # FIX: копия, чтобы не мутировать кэш
+            ids = list(get_last_msg(chat_id))
             if message_id not in ids:
                 ids.append(message_id)
             if len(text) <= 4000 and safe_edit(chat_id, message_id, text, markup):
-                # FIX: подчищаем старые части длинных сообщений
                 for mid in ids:
                     if mid != message_id:
                         safe_delete(chat_id, mid)
@@ -1078,13 +1108,12 @@ def handle_callback(call):
             return None
 
     def progress(text):
-        # временное «⏳...» — редактирует нажатое сообщение, не трогая трекинг
         safe_edit(chat_id, message_id, text, None)
 
     if data == 'noop':
         return
 
-    try:  # FIX: сетевые ошибки больше не оставляют юзера навсегда с «⏳»
+    try:
         # --- выбор группы ---
         if data == 'change_group':
             clear_state(chat_id)
@@ -1117,7 +1146,9 @@ def handle_callback(call):
         if data.startswith('pg|'):
             group = data.split('|', 1)[1]
             save_group(chat_id, group)
-            show(f"✅ Группа выбрана: {group}\n\nВыбери, что показать:", main_menu(group))
+            # ссылки уже в кэше (загрузились в collect_groups) → next посчитается мгновенно
+            show(f"✅ Группа выбрана: {group}\n\nВыбери, что показать:",
+                 main_menu(group, today_local()))
             return
 
         # --- преподаватель ---
@@ -1146,7 +1177,23 @@ def handle_callback(call):
             show(build_teacher_text(query, target, labels[parts[1]]), teacher_menu(query))
             return
 
-        # --- расписание ---
+        # NEW: «➡️ Следующий день» — прыжок на ближайшую дату с таблицей
+        if data.startswith('nd|'):
+            parts = data.split('|', 2)
+            if len(parts) < 3:
+                return
+            try:
+                target = dt.date.fromisoformat(parts[1])
+            except ValueError:
+                return
+            group = parts[2]
+            label = DAY_NAMES[target.weekday()].lower()
+            progress(f"⏳ Загружаю расписание на {label}...")
+            text, shown = schedule_text_for(group, target, label)
+            show(text, main_menu(group, shown))
+            return
+
+        # --- расписание по кнопкам вчера/сегодня/завтра ---
         if '|' not in data:
             return
 
@@ -1163,8 +1210,8 @@ def handle_callback(call):
             return
 
         progress(f"⏳ Загружаю расписание на {label}...")
-        text = build_schedule_text(group, target, label)
-        show(text, main_menu(group))
+        text, shown = schedule_text_for(group, target, label)
+        show(text, main_menu(group, shown))
 
     except Exception as e:
         print(f"=== CALLBACK ERROR === {data}: {e}", flush=True)
@@ -1175,7 +1222,6 @@ def handle_callback(call):
 # --- WEBHOOK ---
 
 def _debug_ok():
-    """DEBUG_KEY задан → /debug требует ?key=...; не задан → открыты как раньше."""
     return (not DEBUG_KEY) or request.args.get('key') == DEBUG_KEY
 
 
@@ -1282,7 +1328,6 @@ def debug_teachers(date_str):
 
 @app.route('/', methods=['POST'])
 def webhook():
-    # FIX: проверка секрета (если WEBHOOK_SECRET задан)
     if WEBHOOK_SECRET and request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
         return '', 403
     try:
@@ -1291,8 +1336,6 @@ def webhook():
         if update is None:
             return '', 200
 
-        # FIX: дедупликация — если обработка шла дольше таймаута Telegram,
-        # тот же апдейт мог прийти повторно
         uid = getattr(update, 'update_id', None)
         if uid is not None:
             if uid in seen_updates:
@@ -1305,13 +1348,15 @@ def webhook():
             text = (msg.text or '').strip()
             print(f"=== WEBHOOK === message: {text[:60]}", flush=True)
             cmd = text.split()[0].split('@')[0].lower() if text.startswith('/') else ''
-            try:  # FIX: юзер получит сообщение об ошибке, а не тишину
+            try:
                 if cmd == '/start':
                     start_message(msg)
                 elif cmd == '/group':
                     group_command(msg)
                 elif cmd == '/teacher':
                     teacher_command(msg, text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else '')
+                elif cmd in DAY_COMMANDS:  # NEW: /today, /tomorrow, /yesterday
+                    day_command(msg, cmd)
                 else:
                     handle_group_input(msg)
             except Exception as e:
