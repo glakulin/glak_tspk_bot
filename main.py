@@ -3,8 +3,10 @@ import re
 import json
 import hashlib
 import traceback
+import html as htmllib
 import datetime as dt
 from io import BytesIO
+from collections import Counter
 from zoneinfo import ZoneInfo
 
 import telebot
@@ -71,7 +73,7 @@ seen_updates = TTLCache(maxsize=10000, ttl=300)
 
 DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
 
-# NEW: команды-дни
+# команды-дни
 DAY_COMMANDS = {
     '/yesterday': (-1, 'вчера'),
     '/today': (0, 'сегодня'),
@@ -87,25 +89,18 @@ MONTHS_RU = [
 GROUP_PROMPT = ("Напиши название своей группы (например, СД-21 или исип41) "
                 "или выбери из списка:")
 
-
-# NEW: меню команд Telegram (видно при вводе «/» в чате).
-# Идемпотентно: при нескольких воркерах просто перезапишется тем же.
-def register_bot_commands():
-    try:
-        bot.set_my_commands([
-            telebot.types.BotCommand('start', 'Запустить бота'),
-            telebot.types.BotCommand('today', 'Расписание на сегодня'),
-            telebot.types.BotCommand('tomorrow', 'Расписание на завтра'),
-            telebot.types.BotCommand('yesterday', 'Расписание на вчера'),
-            telebot.types.BotCommand('group', 'Сменить группу'),
-            telebot.types.BotCommand('teacher', 'Найти преподавателя'),
-        ])
-        print("=== BOOT === меню команд установлено", flush=True)
-    except Exception as e:
-        print(f"=== BOOT === set_my_commands не удалось (не критично): {e}", flush=True)
-
-
-register_bot_commands()
+HELP_TEXT = (
+    "ℹ️ <b>Что умеет бот</b>\n\n"
+    "• Расписание группы: вчера / сегодня / завтра и переход на следующий день\n"
+    "• Поиск преподавателя по фамилии\n"
+    "• Расписание звонков\n"
+    "• 1 и 2 корпус, дополнительное образование\n\n"
+    "<b>Команды</b>\n"
+    "/today, /tomorrow, /yesterday — расписание своей группы\n"
+    "/teacher — поиск преподавателя\n"
+    "/bells — расписание звонков\n"
+    "/group — сменить группу"
+)
 
 
 # --- REDIS ---
@@ -182,6 +177,37 @@ def r_set_json(key, value, ex=None):
     except Exception as e:
         print(f"=== redis dumps ERROR === {key}: {e}", flush=True)
         return False
+
+
+# Меню команд Telegram (видно при вводе «/» в чате).
+# С Redis запрос к Telegram делается раз в неделю на набор команд,
+# а не на каждом холодном старте Vercel.
+BOT_COMMANDS = [
+    ('start', 'Запустить бота'),
+    ('today', 'Расписание на сегодня'),
+    ('tomorrow', 'Расписание на завтра'),
+    ('yesterday', 'Расписание на вчера'),
+    ('teacher', 'Найти преподавателя'),
+    ('bells', 'Расписание звонков'),
+    ('group', 'Сменить группу'),
+    ('help', 'Что умеет бот'),
+]
+
+
+def register_bot_commands():
+    flag = ckey('cmds', hashlib.md5(json.dumps(BOT_COMMANDS).encode('utf-8')).hexdigest()[:8])
+    if r_get(flag):
+        print("=== BOOT === меню команд уже установлено (Redis)", flush=True)
+        return
+    try:
+        bot.set_my_commands([telebot.types.BotCommand(c, d) for c, d in BOT_COMMANDS])
+        r_set(flag, '1', 7 * 86400)
+        print("=== BOOT === меню команд установлено", flush=True)
+    except Exception as e:
+        print(f"=== BOOT === set_my_commands не удалось (не критично): {e}", flush=True)
+
+
+register_bot_commands()
 
 
 # Сохранённая группа по chat_id
@@ -377,7 +403,7 @@ def find_sheets_for_date(target_date):
     return [], target_date
 
 
-# NEW: ближайшая дата СТРОГО позже указанной, для которой на сайте есть таблица.
+# ближайшая дата СТРОГО позже указанной, для которой на сайте есть таблица.
 # Дёшево: список дат уже в кэше (использовался при поиске ссылок).
 def next_schedule_date(from_date):
     try:
@@ -530,10 +556,12 @@ def get_schedule_for_date(target_date):
 
     all_blocks = []
     date_header = None
+    had_error = False
 
     for sheet in sheets:
         dh, blocks, err, tabs = _download_and_parse(sheet)
         if err:
+            had_error = True
             print(f"=== get_schedule_for_date === sheet {sheet['sheet_id'][:12]}… ERROR: {err}", flush=True)
             continue
         if dh and not date_header:
@@ -551,6 +579,9 @@ def get_schedule_for_date(target_date):
              'actual_date': actual_date.isoformat()},
             SCHEDULE_TTL,
         )
+    elif had_error:
+        # сбой скачивания — не запоминаем как «расписания нет»
+        print(f"=== get_schedule_for_date === {key}: сбой скачивания, НЕ кэширую", flush=True)
     else:
         print(f"=== get_schedule_for_date === {key}: блоков 0, кэширую на {NEG_TTL} с", flush=True)
         neg_schedule_cache[key] = result
@@ -560,6 +591,130 @@ def get_schedule_for_date(target_date):
                    NEG_TTL)
 
     return result
+
+
+# --- КАРТОЧКИ ПАР (HTML) ---
+
+def esc(s):
+    return htmllib.escape(str(s), quote=False)
+
+
+def strip_html(s):
+    return htmllib.unescape(re.sub(r'<[^>]+>', '', s))
+
+
+def fmt_time(raw):
+    """'8.30 10.00' / '15:45   17:00' -> '8:30–10:00'"""
+    ts = re.findall(r'\d{1,2}[.:]\d{2}', raw or '')
+    if len(ts) >= 2:
+        return f"{ts[0].replace('.', ':')}–{ts[1].replace('.', ':')}"
+    return re.sub(r'\s+', ' ', raw or '').strip()
+
+
+def short_header(h):
+    """'Расписание занятий на 23 сентября (среда) 2026-2027 уч.года' -> '23 сентября (среда)'"""
+    out = re.sub(r'\d{4}\s*-\s*\d{4}\s*уч\.?\s*года?\.?', '', h or '', flags=re.I)
+    out = re.sub(r'^\s*расписание( занятий)?( на)?\s*', '', out, flags=re.I)
+    out = out.strip(' ,.')
+    return out or (h or '')
+
+
+# «8.30 » / «1час » в начале ячейки = позднее начало / одночасовое занятие
+LEAD_RE = re.compile(r'^(?:(\d{1,2}[.:]\d{2})\s+)?(?:(\d+)\s?час\w*\s+)?')
+ROOM_RE = re.compile(r'каб(?:инет)?\.?\s*(\d+[А-Яа-яA-Za-z]?)', re.I)
+
+
+def _person(name, tail):
+    room = ROOM_RE.search(tail)
+    notes = [n.strip() for n in re.findall(r'\(([^)]*)\)', tail) if n.strip()]
+    rest = tail
+    if room:
+        rest = rest.replace(room.group(0), ' ', 1)
+    rest = re.sub(r'\([^)]*\)', ' ', rest)
+    rest = re.sub(r'\s+', ' ', rest).strip(' ,;.-–')
+    return {'name': name, 'room': room.group(1) if room else None,
+            'notes': notes, 'extra': rest}
+
+
+def parse_cell(cell):
+    """Ячейка -> {subject, people[{name, room, notes, extra}], start, hours}. Без потери текста."""
+    t = re.sub(r'\s+', ' ', cell or '').strip()
+    m = LEAD_RE.match(t)
+    start, hours = m.group(1), m.group(2)
+    t = t[m.end():]
+
+    people = []
+    ms = list(TEACHER_RE.finditer(t))
+    if ms:
+        subject = t[:ms[0].start()]
+        for i, tm in enumerate(ms):
+            end = ms[i + 1].start() if i + 1 < len(ms) else len(t)
+            people.append(_person(f"{tm.group(1)} {tm.group(2)}.{tm.group(3)}.", t[tm.end():end]))
+    else:
+        subject = t
+        rm = ROOM_RE.search(t)
+        if rm:
+            subject = t[:rm.start()] + ' ' + t[rm.end():]
+            people.append({'name': None, 'room': rm.group(1), 'notes': [], 'extra': ''})
+
+    subject = re.sub(r'\s+', ' ', subject).strip(' ,;-–')
+    return {'subject': subject or t, 'people': people, 'start': start, 'hours': hours}
+
+
+def person_line(p, highlight=None):
+    parts = []
+    if p['name']:
+        nm = esc(p['name'])
+        parts.append("👨‍🏫 " + (f"<b>{nm}</b>" if p['name'] == highlight else nm))
+    if p['room']:
+        parts.append(f"📍 каб.{esc(p['room'])}")
+    for n in p['notes']:
+        parts.append("💻 дистанционно" if 'дистанц' in n.lower() else esc(n))
+    if p['extra']:
+        parts.append(esc(p['extra']))
+    return " · ".join(parts)
+
+
+def split_cell(cell):
+    """Если в ячейке несколько строк и в КАЖДОЙ есть преподаватель — это отдельные занятия
+    (так склеиваются дубли колонок группы). Иначе перенос строки — просто часть текста."""
+    segs = [x.strip() for x in (cell or '').split('\n') if x.strip()]
+    if len(segs) > 1 and all(TEACHER_RE.search(x) for x in segs):
+        return segs
+    return [cell or '']
+
+
+def render_lesson(pair, time_raw, cell, highlight=None, prefix_lines=None):
+    segs = split_cell(cell)
+    if highlight and len(segs) > 1:
+        mine = [x for x in segs if highlight in extract_teachers(x)]
+        segs = mine or segs
+
+    header = None
+    lines = []
+    for i, seg in enumerate(segs):
+        p = parse_cell(seg)
+        flags = []
+        if p['start']:
+            flags.append(f"⏰ с {esc(p['start'].replace('.', ':'))}")
+        if p['hours']:
+            flags.append(f"⌛ {esc(p['hours'])} ч")
+        if i == 0:
+            header = f"🔹 <b>{esc(pair)} пара</b> · {esc(fmt_time(time_raw))}"
+            for f in flags:
+                header += f" · {f}"
+            lines.append(header)
+            if prefix_lines:
+                lines.extend(prefix_lines)
+            lines.append(f"   {esc(p['subject'])}")
+        else:
+            lines.append("   " + " · ".join(flags + [esc(p['subject'])]))
+        for person in p['people']:
+            line = person_line(person, highlight)
+            if line:
+                lines.append("   " + line)
+    lines.append("")
+    return lines
 
 
 # --- ФОРМАТИРОВАНИЕ И ПОИСК ГРУППЫ ---
@@ -602,12 +757,12 @@ def format_day_for_group(date_header, blocks, group_query):
         hint = ''
         if all_groups:
             sample = ', '.join(sorted(all_groups)[:20])
-            hint = f"\n\n📋 Группы в таблице: {sample}"
-        return f"🔍 Группа «{group_query}» не найдена в расписании на этот день.{hint}"
+            hint = f"\n\n📋 Группы в таблице: {esc(sample)}"
+        return f"🔍 Группа «{esc(group_query)}» не найдена в расписании на этот день.{hint}"
 
     lines = []
     if date_header:
-        lines.append(f"📅 {date_header}\n")
+        lines.append(f"📅 <b>{esc(short_header(date_header))}</b>\n")
 
     has_content = False
     for bi, g in matches:
@@ -617,28 +772,22 @@ def format_day_for_group(date_header, blocks, group_query):
             cell = row['cells'].get(g, '').strip()
             if not cell:
                 continue
-            time_str = row['time'].replace('\n', '–').replace('  ', ' ').strip()
-            block_lines.append(f"🔹 {row['pair']} пара ({time_str})")
-            for l in cell.split('\n'):
-                l = l.strip()
-                if l:
-                    block_lines.append(f"   {l}")
-            block_lines.append("")
+            block_lines.extend(render_lesson(row['pair'], row['time'], cell))
 
         if block_lines:
             has_content = True
             campus = block.get('campus', '')
-            title = f"👥 Группа {g.strip()}" + (f" · {campus}" if campus else "")
+            title = f"👥 <b>Группа {esc(g.strip())}</b>" + (f" · {esc(campus)}" if campus else "")
             lines.append(title)
             lines.extend(block_lines)
 
     if not has_content:
-        return f"🔍 По группе «{group_query}» занятий не найдено."
+        return f"🔍 По группе «{esc(group_query)}» занятий не найдено."
 
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
 
-# NEW: единая точка построения текста расписания.
+# единая точка построения текста расписания.
 # Возвращает (text, shown_date), где shown_date — дата фактически показанного
 # расписания (или target, если расписания нет). Нужна для кнопки «Следующий день».
 def schedule_text_for(group, target, label):
@@ -661,10 +810,98 @@ def schedule_text_for(group, target, label):
     return text, actual
 
 
+# --- БЛОКИ НА БЛИЖАЙШУЮ ДАТУ (для списка групп и звонков) ---
+
+def blocks_near_today():
+    _, blocks, actual = get_schedule_for_date(today_local())
+
+    if not blocks:
+        try:
+            dates = get_available_dates()
+        except Exception as e:
+            print(f"=== blocks_near_today === get_available_dates ERROR: {e}", flush=True)
+            dates = []
+        today = today_local()
+        candidates = sorted(dates, key=lambda d: abs((d - today).days))[:4]
+        for d in candidates:
+            _, b, act = get_schedule_for_date(d)
+            if b:
+                return b, act
+    return blocks, actual
+
+
+# --- ЗВОНКИ ---
+
+def to_min(t):
+    h, m = t.split(':')
+    return int(h) * 60 + int(m)
+
+
+def collect_bells():
+    """{корпус: {номер пары: '8:30–10:00'}} по колонке «Время» ближайшей таблицы."""
+    blocks, actual = blocks_near_today()
+    per = {}
+    for b in blocks:
+        campus = b.get('campus') or 'Без корпуса'
+        for row in b['rows']:
+            t = fmt_time(row['time'])
+            if t and row['pair'].isdigit():
+                per.setdefault(campus, {}).setdefault(int(row['pair']), Counter())[t] += 1
+    result = {c: {p: cnt.most_common(1)[0][0] for p, cnt in d.items()} for c, d in per.items()}
+    return result, actual
+
+
+def bells_lines(times):
+    lines = []
+    pairs = sorted(times)
+    for i, p in enumerate(pairs):
+        t = times[p]
+        line = f"🔹 <b>{p} пара</b> · {esc(t)}"
+        if i + 1 < len(pairs) and pairs[i + 1] == p + 1:
+            a = re.findall(r'\d{1,2}:\d{2}', t)
+            b = re.findall(r'\d{1,2}:\d{2}', times[pairs[i + 1]])
+            if len(a) == 2 and len(b) == 2:
+                gap = to_min(b[0]) - to_min(a[1])
+                if 0 < gap < 120:
+                    line += f"  (перемена {gap} мин)"
+        lines.append(line)
+    return lines
+
+
+def build_bells_text():
+    result, actual = collect_bells()
+    if not result:
+        return "😔 Не удалось получить время пар из расписания."
+
+    # корпуса с совпадающими временами (на общих парах) объединяем в один список
+    order = sorted(result.items(), key=lambda kv: (-len(kv[1]), list(result).index(kv[0])))
+    groups = []  # [(названия корпусов, {пара: время})]
+    for campus, times in order:
+        for names, merged in groups:
+            if all(merged.get(p, t) == t for p, t in times.items()):
+                names.append(campus)
+                merged.update(times)
+                break
+        else:
+            groups.append(([campus], dict(times)))
+
+    lines = ["🔔 <b>Расписание звонков</b>",
+             f"по таблице на {actual.strftime('%d.%m.%Y')}\n"]
+    if len(groups) == 1:
+        lines.extend(bells_lines(groups[0][1]))
+    else:
+        for names, times in groups:
+            lines.append(f"🏫 <b>{esc(', '.join(names))}</b>")
+            lines.extend(bells_lines(times))
+            lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 # --- ПОИСК ПРЕПОДАВАТЕЛЯ ---
 
-TEACHER_RE = re.compile(r'([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)\s+([А-ЯЁ])\.\s?([А-ЯЁ])\.')
-TEACHER_RE_REVERSED = re.compile(r'([А-ЯЁ])\.\s?([А-ЯЁ])\.\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)')
+# «Фамилия И.О.» (дефис в фамилии; инициалы с пробелом или без; после
+# второго инициала допускается опечатка-запятая: «Карягина А.А,,»)
+TEACHER_RE = re.compile(r'([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)\s+([А-ЯЁ])\.\s?([А-ЯЁ])[.,]')
 MAX_TEACHERS_SHOWN = 6
 TEACHER_PROMPT = ("👨‍🏫 Введи фамилию преподавателя (например, Шаров или Шаров С.А.).\n"
                   "Достаточно первых 3 букв.")
@@ -688,10 +925,6 @@ def extract_teachers(cell):
         name = f"{m.group(1)} {m.group(2)}.{m.group(3)}."
         if name not in result:
             result.append(name)
-    for m in TEACHER_RE_REVERSED.finditer(cell):
-        name = f"{m.group(3)} {m.group(1)}.{m.group(2)}."
-        if name not in result:
-            result.append(name)
     return result
 
 
@@ -704,7 +937,7 @@ def index_teachers(blocks):
                 cell = row['cells'].get(g, '').strip()
                 if not cell:
                     continue
-                text = re.sub(r'\s+', ' ', cell)
+                text = '\n'.join(re.sub(r'\s+', ' ', ln).strip() for ln in cell.split('\n') if ln.strip())
                 for name in extract_teachers(cell):
                     idx.setdefault(name, []).append({
                         'pair': row['pair'], 'time': row['time'],
@@ -730,10 +963,10 @@ def find_teachers(idx, query):
 def format_teacher_day(date_header, idx, names):
     lines = []
     if date_header:
-        lines.append(f"📅 {date_header}\n")
+        lines.append(f"📅 <b>{esc(short_header(date_header))}</b>\n")
 
     for name in sorted(names):
-        lines.append(f"👨‍🏫 {name}")
+        lines.append(f"👨‍🏫 <b>{esc(name)}</b>")
         merged = {}
         for l in idx[name]:
             k = (l['pair'], l['campus'], l['text'])
@@ -747,12 +980,9 @@ def format_teacher_day(date_header, idx, names):
         for k in sorted(merged, key=order):
             pair, campus, text = k
             m = merged[k]
-            time_str = m['time'].replace('\n', '–').replace('  ', ' ').strip()
-            where = ', '.join(m['groups']) + (f" · {campus}" if campus else "")
-            lines.append(f"🔹 {pair} пара ({time_str})")
-            lines.append(f"   👥 {where}")
-            lines.append(f"   {text}")
-            lines.append("")
+            where = ', '.join(esc(g) for g in m['groups']) + (f" · {esc(campus)}" if campus else "")
+            lines.extend(render_lesson(pair, m['time'], text, highlight=name,
+                                       prefix_lines=[f"   👥 {where}"]))
     return "\n".join(lines).rstrip()
 
 
@@ -766,13 +996,13 @@ def build_teacher_text(query, target_date, label):
     names = find_teachers(idx, query)
 
     if not names:
-        return (f"🔍 Преподаватель «{query}» на {actual_date.strftime('%d.%m.%Y')} "
+        return (f"🔍 Преподаватель «{esc(query)}» на {actual_date.strftime('%d.%m.%Y')} "
                 f"в расписании не найден.\n\n"
                 f"Возможно, в этот день у него нет занятий, либо фамилия написана иначе.")
 
     if len(names) > MAX_TEACHERS_SHOWN:
         shown = ', '.join(sorted(names)[:15])
-        return (f"🔍 По запросу «{query}» найдено {len(names)} преподавателей: {shown}…\n\n"
+        return (f"🔍 По запросу «{esc(query)}» найдено {len(names)} преподавателей: {esc(shown)}…\n\n"
                 f"Уточни запрос — фамилию или фамилию с инициалами.")
 
     text = format_teacher_day(date_header, idx, names)
@@ -813,21 +1043,7 @@ def course_of(g):
 
 
 def collect_groups():
-    _, blocks, actual = get_schedule_for_date(today_local())
-
-    if not blocks:
-        try:
-            dates = get_available_dates()
-        except Exception as e:
-            print(f"=== collect_groups === get_available_dates ERROR: {e}", flush=True)
-            dates = []
-        today = today_local()
-        candidates = sorted(dates, key=lambda d: abs((d - today).days))[:4]
-        for d in candidates:
-            _, b, act = get_schedule_for_date(d)
-            if b:
-                blocks, actual = b, act
-                break
+    blocks, actual = blocks_near_today()
 
     result = {}
     for b in blocks:
@@ -842,8 +1058,8 @@ def collect_groups():
 
 # --- КНОПКИ ---
 
-# NEW: показанному расписанию соответствует shown_date — от неё считается
-# кнопка «➡️ Следующий день». Callback: nd|{дата}|{группа} — 3+10+1+45 ≤ 64 байт.
+# shown_date — дата показанного расписания, от неё считается «➡️ Следующий день».
+# Callback: nd|{дата}|{группа} — 3+10+1+45 ≤ 64 байт.
 def main_menu(group, shown_date=None):
     g = trunc_bytes(group.strip(), 45)
     kb = InlineKeyboardMarkup(row_width=3)
@@ -860,9 +1076,10 @@ def main_menu(group, shown_date=None):
                 callback_data=f"nd|{nxt.isoformat()}|{g}",
             ))
     kb.add(
-        InlineKeyboardButton("👥 Сменить группу", callback_data="change_group"),
+        InlineKeyboardButton("🔔 Звонки", callback_data=f"bells|{g}"),
         InlineKeyboardButton("👨‍🏫 Преподаватель", callback_data="tsearch"),
     )
+    kb.add(InlineKeyboardButton("👥 Сменить группу", callback_data="change_group"))
     return kb
 
 
@@ -922,19 +1139,40 @@ def safe_edit(chat_id, message_id, text, reply_markup=None):
     try:
         bot.edit_message_text(
             chat_id=chat_id, message_id=message_id,
-            text=text, reply_markup=reply_markup, timeout=10,
+            text=text, reply_markup=reply_markup, parse_mode='HTML', timeout=10,
         )
         return True
     except Exception as e:
+        if 'parse entities' in str(e).lower():
+            print(f"=== safe_edit === HTML отклонён, шлю без разметки: {e}", flush=True)
+            try:
+                bot.edit_message_text(
+                    chat_id=chat_id, message_id=message_id,
+                    text=strip_html(text), reply_markup=reply_markup, timeout=10,
+                )
+                return True
+            except Exception as e2:
+                print(f"=== safe_edit (plain) === {e2}", flush=True)
+                return False
         print(f"=== safe_edit === {e}", flush=True)
         return False
+
+
+def _send(chat_id, text, reply_markup=None):
+    try:
+        return bot.send_message(chat_id, text, reply_markup=reply_markup,
+                                parse_mode='HTML', timeout=10)
+    except Exception as e:
+        if 'parse entities' in str(e).lower():
+            print(f"=== send === HTML отклонён, шлю без разметки: {e}", flush=True)
+            return bot.send_message(chat_id, strip_html(text), reply_markup=reply_markup, timeout=10)
+        raise
 
 
 def send_long(chat_id, text, reply_markup=None):
     MAX = 4000
     if len(text) <= MAX:
-        sent = bot.send_message(chat_id, text, reply_markup=reply_markup, timeout=10)
-        return [sent.message_id]
+        return [_send(chat_id, text, reply_markup).message_id]
 
     parts, current = [], ""
     for line in text.split('\n'):
@@ -949,8 +1187,7 @@ def send_long(chat_id, text, reply_markup=None):
     ids = []
     for i, part in enumerate(parts):
         markup = reply_markup if i == len(parts) - 1 else None
-        sent = bot.send_message(chat_id, part, reply_markup=markup, timeout=10)
-        ids.append(sent.message_id)
+        ids.append(_send(chat_id, part, markup).message_id)
     return ids
 
 
@@ -962,7 +1199,7 @@ def send_fresh(chat_id, text, reply_markup=None):
     return new_ids[-1] if new_ids else None
 
 
-# NEW: заменяет последний ответ бота (например, «⏳») на готовый текст
+# заменяет последний ответ бота (например, «⏳») на готовый текст
 # редактированием; если не вышло (длинный текст) — удаляет и шлёт заново.
 def replace_fresh(chat_id, text, reply_markup=None):
     ids = get_last_msg(chat_id)
@@ -994,7 +1231,7 @@ def start_message(msg):
     if group:
         send_fresh(
             chat_id,
-            f"👋 С возвращением! Твоя группа: {group}\n\nВыбери, что показать:",
+            f"👋 С возвращением! Твоя группа: {esc(group)}\n\nВыбери, что показать:",
             reply_markup=main_menu(group),
         )
     else:
@@ -1010,7 +1247,24 @@ def group_command(msg):
     send_fresh(msg.chat.id, GROUP_PROMPT, reply_markup=pick_button())
 
 
-# NEW: /today, /tomorrow, /yesterday — по группе, сохранённой для chat_id
+def help_command(msg):
+    chat_id = msg.chat.id
+    clear_state(chat_id)
+    group = get_saved_group(chat_id)
+    send_fresh(chat_id, HELP_TEXT,
+               reply_markup=main_menu(group) if group else pick_button())
+
+
+def bells_command(msg):
+    chat_id = msg.chat.id
+    clear_state(chat_id)
+    group = get_saved_group(chat_id)
+    send_fresh(chat_id, "⏳ Загружаю звонки...", None)
+    replace_fresh(chat_id, build_bells_text(),
+                  main_menu(group) if group else pick_button())
+
+
+# /today, /tomorrow, /yesterday — по группе, сохранённой для chat_id
 # (работают и в личке, и в групповом чате, куда бот добавлен).
 def day_command(msg, cmd):
     chat_id = msg.chat.id
@@ -1038,7 +1292,7 @@ def handle_group_input(msg):
     if not looks_like_group(group):
         send_fresh(
             chat_id,
-            f"🤔 «{group}» не похоже на название группы.\n\n"
+            f"🤔 «{esc(group)}» не похоже на название группы.\n\n"
             f"Напиши её номером, например СД-21 или исип41,\n"
             f"либо выбери из списка:",
             reply_markup=pick_button(),
@@ -1047,7 +1301,7 @@ def handle_group_input(msg):
     save_group(chat_id, group)
     send_fresh(
         chat_id,
-        f"✅ Группа сохранена: {group}\n\nВыбери, что показать:",
+        f"✅ Группа сохранена: {esc(group)}\n\nВыбери, что показать:",
         reply_markup=main_menu(group),
     )
 
@@ -1140,14 +1394,14 @@ def handle_callback(call):
             if not campus:
                 show("Список изменился, выбери корпус заново:", campus_menu(by_campus))
                 return
-            show(f"🏫 {campus}\nВыбери группу:", groups_menu(by_campus[campus], key, page))
+            show(f"🏫 {esc(campus)}\nВыбери группу:", groups_menu(by_campus[campus], key, page))
             return
 
         if data.startswith('pg|'):
             group = data.split('|', 1)[1]
             save_group(chat_id, group)
             # ссылки уже в кэше (загрузились в collect_groups) → next посчитается мгновенно
-            show(f"✅ Группа выбрана: {group}\n\nВыбери, что показать:",
+            show(f"✅ Группа выбрана: {esc(group)}\n\nВыбери, что показать:",
                  main_menu(group, today_local()))
             return
 
@@ -1173,11 +1427,11 @@ def handle_callback(call):
                 return
             query = parts[2]
             target = today_local() + dt.timedelta(days=int(parts[1]))
-            progress(f"⏳ Ищу «{query}» на {labels[parts[1]]}...")
+            progress(f"⏳ Ищу «{esc(query)}» на {labels[parts[1]]}...")
             show(build_teacher_text(query, target, labels[parts[1]]), teacher_menu(query))
             return
 
-        # NEW: «➡️ Следующий день» — прыжок на ближайшую дату с таблицей
+        # --- «➡️ Следующий день»: прыжок на ближайшую дату с таблицей ---
         if data.startswith('nd|'):
             parts = data.split('|', 2)
             if len(parts) < 3:
@@ -1191,6 +1445,13 @@ def handle_callback(call):
             progress(f"⏳ Загружаю расписание на {label}...")
             text, shown = schedule_text_for(group, target, label)
             show(text, main_menu(group, shown))
+            return
+
+        # --- звонки ---
+        if data.startswith('bells|'):
+            group = data.split('|', 1)[1]
+            progress("⏳ Загружаю звонки...")
+            show(build_bells_text(), main_menu(group))
             return
 
         # --- расписание по кнопкам вчера/сегодня/завтра ---
@@ -1355,8 +1616,12 @@ def webhook():
                     group_command(msg)
                 elif cmd == '/teacher':
                     teacher_command(msg, text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else '')
-                elif cmd in DAY_COMMANDS:  # NEW: /today, /tomorrow, /yesterday
+                elif cmd in DAY_COMMANDS:  # /today, /tomorrow, /yesterday
                     day_command(msg, cmd)
+                elif cmd == '/bells':
+                    bells_command(msg)
+                elif cmd == '/help':
+                    help_command(msg)
                 else:
                     handle_group_input(msg)
             except Exception as e:
