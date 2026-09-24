@@ -25,7 +25,15 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения.")
 
-print("=== BOOT === Токен загружен", flush=True)
+# FIX: секрет вебхука. Если задать переменную WEBHOOK_SECRET, POST-запросы
+# без правильного заголовка X-Telegram-Bot-Api-Secret-Token отклоняются (403).
+# При регистрации вебхука передать тот же secret_token. Не задан — как раньше.
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
+# FIX: если задать DEBUG_KEY, /debug* открываются только с ?key=DEBUG_KEY
+DEBUG_KEY = os.getenv('DEBUG_KEY')
+
+print(f"=== BOOT === Токен загружен | webhook_secret: {'да' if WEBHOOK_SECRET else 'нет'}"
+      f" | debug_key: {'да' if DEBUG_KEY else 'нет'}", flush=True)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 telebot.apihelper.CONNECT_TIMEOUT = 5
@@ -48,14 +56,25 @@ def today_local():
 
 # Кэш в памяти (живёт, пока «тёплый» инстанс) + Redis (общий между вызовами)
 SCHEDULE_TTL = 1800
+NEG_TTL = 300         # FIX: короткий негативный кэш «расписания нет» — не долбим Google
 LINKS_TTL = 600
 LASTMSG_TTL = 172800  # 48 ч: старее Telegram всё равно не даёт удалять
-CACHE_VERSION = 'v2'  # поменять при изменении формата кэша
+STATE_TTL = 600
+CACHE_VERSION = 'v3'  # FIX: поднял версию — изменилась склейка дублей групп в blocks
+PAGE_SIZE = 40  # групп на страницу (лимит Telegram — 100 кнопок)
+INCLUDE_HIDDEN_TABS = os.getenv('INCLUDE_HIDDEN_TABS') == '1'  # читать и скрытые вкладки
 
 schedule_cache = TTLCache(maxsize=30, ttl=SCHEDULE_TTL)
+neg_schedule_cache = TTLCache(maxsize=30, ttl=NEG_TTL)  # FIX: отдельный кэш «пусто»
 links_cache = TTLCache(maxsize=1, ttl=LINKS_TTL)
 
-last_bot_message = {}  # запасной вариант, если Redis недоступен
+# FIX: раньше были безразмерные dict — теперь сами очищаются
+last_bot_message = TTLCache(maxsize=5000, ttl=LASTMSG_TTL)
+chat_state = TTLCache(maxsize=5000, ttl=STATE_TTL + 60)
+
+# FIX: дедупликация апдейтов — Telegram может прислать один апдейт дважды,
+# если обработка заняла больше его таймаута
+seen_updates = TTLCache(maxsize=10000, ttl=300)
 
 DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
 
@@ -67,8 +86,6 @@ MONTHS_RU = [
 
 GROUP_PROMPT = ("Напиши название своей группы (например, СД-21 или исип41) "
                 "или выбери из списка:")
-PAGE_SIZE = 40  # групп на страницу (лимит Telegram — 100 кнопок)
-INCLUDE_HIDDEN_TABS = os.getenv('INCLUDE_HIDDEN_TABS') == '1'  # читать и скрытые вкладки
 
 
 # --- REDIS ---
@@ -157,35 +174,51 @@ def save_group(chat_id, group):
     r_set(f"tspk:group:{chat_id}", group)
 
 
-# id последнего сообщения бота (для режима «одно сообщение»)
+# id последних сообщений бота (для режима «одно сообщение»)
+# FIX: теперь хранится СПИСОК id — длинные ответы из нескольких сообщений
+# удаляются целиком, а не только последняя часть.
+
 def get_last_msg(chat_id):
-    if chat_id in last_bot_message:
-        return last_bot_message[chat_id]
-    v = r_get(f"tspk:lastmsg:{chat_id}")
+    v = last_bot_message.get(chat_id)
+    if v is None:
+        v = r_get(f"tspk:lastmsg:{chat_id}")
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        return [int(x) for x in v if str(x).strip().lstrip('-').isdigit()]
+
+    s = str(v).strip()
+    if not s:
+        return []
     try:
-        return int(v) if v else None
+        parsed = json.loads(s)
+    except ValueError:
+        # старый формат: просто число строкой
+        return [int(s)] if s.lstrip('-').isdigit() else []
+    if isinstance(parsed, list):
+        return [int(x) for x in parsed if str(x).strip().lstrip('-').isdigit()]
+    try:
+        return [int(parsed)]
     except (TypeError, ValueError):
-        return None
+        return []
 
 
-def set_last_msg(chat_id, message_id):
-    if message_id:
-        last_bot_message[chat_id] = message_id
-        r_set(f"tspk:lastmsg:{chat_id}", str(message_id), LASTMSG_TTL)
+def set_last_msg(chat_id, ids):
+    ids = [int(i) for i in (ids or []) if i]
+    if not ids:
+        return
+    last_bot_message[chat_id] = ids
+    r_set(f"tspk:lastmsg:{chat_id}", json.dumps(ids), LASTMSG_TTL)
 
 
 def pop_last_msg(chat_id):
-    old = get_last_msg(chat_id)
+    ids = get_last_msg(chat_id)
     last_bot_message.pop(chat_id, None)
     r_delete(f"tspk:lastmsg:{chat_id}")
-    return old
+    return ids
 
 
 # Состояние диалога: 'teacher' = ждём фамилию преподавателя
-STATE_TTL = 600
-chat_state = {}  # запасной вариант, если Redis не подключён
-
-
 def get_state(chat_id):
     if redis:
         v = r_get(f"tspk:state:{chat_id}")
@@ -365,6 +398,7 @@ def parse_schedule_rows(rows, campus=''):
     date_header = None
     blocks = []
     current = None
+    col_groups = []  # имя группы для каждой колонки (с возможными дублями)
 
     for row in rows:
         if not row or not any(c.strip() for c in row):
@@ -377,7 +411,16 @@ def parse_schedule_rows(rows, campus=''):
             raw_groups = [c.strip() for c in row[2:]]
             while raw_groups and not raw_groups[-1]:
                 raw_groups.pop()
-            groups = [clean_group_name(g) for g in raw_groups]
+            # FIX: если две колонки после чистки дали одно имя
+            # («ИСиП-41 1 смена» и «ИСиП-41 2 смена» → «ИСиП-41»),
+            # раньше вторая молча перезаписывала первую и занятия терялись.
+            # Теперь содержимое таких колонок склеивается через \n,
+            # а в списке групп имя остаётся в единственном экземпляре.
+            col_groups = [clean_group_name(g) for g in raw_groups]
+            groups = []
+            for g in col_groups:
+                if g and g not in groups:
+                    groups.append(g)
             current = {'groups': groups, 'rows': [], 'campus': campus}
             blocks.append(current)
             continue
@@ -389,8 +432,17 @@ def parse_schedule_rows(rows, campus=''):
         if current is not None and first.isdigit():
             time_slot = row[1].strip() if len(row) > 1 else ''
             cells = {}
-            for i, g in enumerate(current['groups']):
-                cells[g] = row[i + 2].strip() if i + 2 < len(row) else ''
+            for i, g in enumerate(col_groups):
+                if not g:
+                    continue
+                val = row[i + 2].strip() if i + 2 < len(row) else ''
+                if not val:
+                    continue
+                if g in cells:
+                    if val not in cells[g]:
+                        cells[g] = cells[g] + '\n' + val
+                else:
+                    cells[g] = val
             current['rows'].append({'pair': first, 'time': time_slot, 'cells': cells})
 
     return date_header, blocks
@@ -432,11 +484,21 @@ def get_schedule_for_date(target_date):
         print(f"=== get_schedule_for_date === {key}: из памяти, блоков {len(cached[1])}", flush=True)
         return cached
 
+    # FIX: негативный кэш — не качаем xlsx повторно, если расписания точно нет
+    if key in neg_schedule_cache:
+        cached = neg_schedule_cache[key]
+        print(f"=== get_schedule_for_date === {key}: из памяти (пусто)", flush=True)
+        return cached
+
     raw = r_get_json(ckey('sch', key))
-    if raw and raw.get('blocks'):
+    if raw is not None and 'blocks' in raw:
         try:
-            result = (raw['date_header'], raw['blocks'], dt.date.fromisoformat(raw['actual_date']))
-            schedule_cache[key] = result
+            result = (raw.get('date_header'), raw['blocks'],
+                      dt.date.fromisoformat(raw['actual_date']))
+            if result[1]:
+                schedule_cache[key] = result
+            else:
+                neg_schedule_cache[key] = result
             print(f"=== get_schedule_for_date === {key}: из Redis, блоков {len(result[1])}", flush=True)
             return result
         except Exception as e:
@@ -445,7 +507,13 @@ def get_schedule_for_date(target_date):
     sheets, actual_date = find_sheets_for_date(target_date)
     if not sheets:
         print(f"=== get_schedule_for_date === {key}: нет ссылок", flush=True)
-        return None, [], target_date
+        result = (None, [], actual_date)
+        neg_schedule_cache[key] = result
+        r_set_json(ckey('sch', key),
+                   {'date_header': None, 'blocks': [],
+                    'actual_date': actual_date.isoformat()},
+                   NEG_TTL)
+        return result
 
     print(f"=== get_schedule_for_date === {key}: найдено {len(sheets)} ссылок, качаю...", flush=True)
 
@@ -473,7 +541,13 @@ def get_schedule_for_date(target_date):
             SCHEDULE_TTL,
         )
     else:
-        print(f"=== get_schedule_for_date === {key}: блоков 0, НЕ кэширую", flush=True)
+        # FIX: пустой результат тоже кэшируем (коротко), чтобы не качать xlsx на каждый запрос
+        print(f"=== get_schedule_for_date === {key}: блоков 0, кэширую на {NEG_TTL} с", flush=True)
+        neg_schedule_cache[key] = result
+        r_set_json(ckey('sch', key),
+                   {'date_header': date_header, 'blocks': [],
+                    'actual_date': actual_date.isoformat()},
+                   NEG_TTL)
 
     return result
 
@@ -558,6 +632,8 @@ def format_day_for_group(date_header, blocks, group_query):
 
 # «Фамилия И.О.» (с дефисом в фамилии, инициалы с пробелом или без)
 TEACHER_RE = re.compile(r'([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)\s+([А-ЯЁ])\.\s?([А-ЯЁ])\.')
+# FIX: второй формат — «И.О. Фамилия»
+TEACHER_RE_REVERSED = re.compile(r'([А-ЯЁ])\.\s?([А-ЯЁ])\.\s+([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)')
 MAX_TEACHERS_SHOWN = 6
 TEACHER_PROMPT = ("👨‍🏫 Введи фамилию преподавателя (например, Шаров или Шаров С.А.).\n"
                   "Достаточно первых 3 букв.")
@@ -580,6 +656,10 @@ def extract_teachers(cell):
     result = []
     for m in TEACHER_RE.finditer(cell):
         name = f"{m.group(1)} {m.group(2)}.{m.group(3)}."
+        if name not in result:
+            result.append(name)
+    for m in TEACHER_RE_REVERSED.finditer(cell):
+        name = f"{m.group(3)} {m.group(1)}.{m.group(2)}."
         if name not in result:
             result.append(name)
     return result
@@ -675,7 +755,8 @@ def build_teacher_text(query, target_date, label):
 
 
 def teacher_menu(query):
-    q = trunc_bytes(clean_query(query), 40)
+    # FIX: запас по байтам увеличен (64 - префикс "td|-1|" = 6 байт)
+    q = trunc_bytes(clean_query(query), 45)
     kb = InlineKeyboardMarkup(row_width=3)
     kb.add(
         InlineKeyboardButton("📅 Вчера", callback_data=f"td|-1|{q}"),
@@ -708,6 +789,23 @@ def course_of(g):
 def collect_groups():
     """{корпус: [группы]} по расписанию на сегодня (или ближайшую дату). Порядок — как вкладки."""
     _, blocks, actual = get_schedule_for_date(today_local())
+
+    # FIX: в длинные праздники рядом может не быть расписания —
+    # пробуем ближайшие даты, по которым вообще есть таблицы
+    if not blocks:
+        try:
+            dates = get_available_dates()
+        except Exception as e:
+            print(f"=== collect_groups === get_available_dates ERROR: {e}", flush=True)
+            dates = []
+        today = today_local()
+        candidates = sorted(dates, key=lambda d: abs((d - today).days))[:4]
+        for d in candidates:
+            _, b, act = get_schedule_for_date(d)
+            if b:
+                blocks, actual = b, act
+                break
+
     result = {}
     for b in blocks:
         campus = b.get('campus') or 'Без корпуса'
@@ -722,7 +820,8 @@ def collect_groups():
 # --- КНОПКИ ---
 
 def main_menu(group):
-    g = trunc_bytes(group.strip(), 40)
+    # FIX: было 40 — увеличен запас (64 байта минус "yesterday|" = 10)
+    g = trunc_bytes(group.strip(), 50)
     kb = InlineKeyboardMarkup(row_width=3)
     kb.add(
         InlineKeyboardButton("📅 Вчера", callback_data=f"yesterday|{g}"),
@@ -760,7 +859,8 @@ def groups_menu(groups, key, page=0):
     chunk = ordered[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
     kb = InlineKeyboardMarkup(row_width=4)
-    buttons = [InlineKeyboardButton(g, callback_data=f"pg|{g[:20]}") for g in chunk]
+    # FIX: раньше g[:20] мог обрезать длинное имя группы — теперь лимит по байтам (3+60 ≤ 64)
+    buttons = [InlineKeyboardButton(g, callback_data=f"pg|{trunc_bytes(g, 60)}") for g in chunk]
     for i in range(0, len(buttons), 4):
         kb.row(*buttons[i:i + 4])
 
@@ -801,10 +901,11 @@ def safe_edit(chat_id, message_id, text, reply_markup=None):
 
 
 def send_long(chat_id, text, reply_markup=None):
+    """FIX: возвращает список id всех отправленных сообщений (не только последнего)."""
     MAX = 4000
     if len(text) <= MAX:
         sent = bot.send_message(chat_id, text, reply_markup=reply_markup, timeout=10)
-        return sent.message_id
+        return [sent.message_id]
 
     parts, current = [], ""
     for line in text.split('\n'):
@@ -816,32 +917,34 @@ def send_long(chat_id, text, reply_markup=None):
     if current:
         parts.append(current)
 
-    last_id = None
+    ids = []
     for i, part in enumerate(parts):
         markup = reply_markup if i == len(parts) - 1 else None
         sent = bot.send_message(chat_id, part, reply_markup=markup, timeout=10)
-        last_id = sent.message_id
-    return last_id
-
-
-def send_or_edit(chat_id, message_id, text, reply_markup=None):
-    MAX = 4000
-    if message_id and len(text) <= MAX:
-        if safe_edit(chat_id, message_id, text, reply_markup):
-            return message_id
-
-    if message_id:
-        safe_delete(chat_id, message_id)
-    return send_long(chat_id, text, reply_markup)
+        ids.append(sent.message_id)
+    return ids
 
 
 def send_fresh(chat_id, text, reply_markup=None):
-    old_id = pop_last_msg(chat_id)
-    if old_id:
-        safe_delete(chat_id, old_id)
-    new_id = send_long(chat_id, text, reply_markup)
-    set_last_msg(chat_id, new_id)
-    return new_id
+    # FIX: удаляем ВСЕ части прошлого ответа, а не только последнюю
+    for mid in pop_last_msg(chat_id):
+        safe_delete(chat_id, mid)
+    new_ids = send_long(chat_id, text, reply_markup)
+    set_last_msg(chat_id, new_ids)
+    return new_ids[-1] if new_ids else None
+
+
+# --- ВАЛИДАЦИЯ ВВОДА ГРУППЫ ---
+
+# FIX: у реальных групп всегда есть цифра (номер курса/группы),
+# поэтому «спасибо» больше не сохранится как группа
+GROUP_INPUT_RE = re.compile(r'^[0-9A-Za-zА-Яа-яЁё][0-9A-Za-zА-Яа-яЁё \-/.]{0,29}$')
+
+
+def looks_like_group(text):
+    if not GROUP_INPUT_RE.match(text):
+        return False
+    return any(ch.isdigit() for ch in text)
 
 
 # --- ОБРАБОТЧИКИ ---
@@ -870,16 +973,27 @@ def group_command(msg):
 
 
 def handle_group_input(msg):
-    group = (msg.text or '').strip()
+    chat_id = msg.chat.id
+    # FIX: чистим ввод (если юзер скопировал «НК-21 (1 смена)» — останется «НК-21»)
+    group = clean_group_name((msg.text or '').strip())
     if not group or group.startswith('/'):
         return
-    if get_state(msg.chat.id) == 'teacher':
-        clear_state(msg.chat.id)
-        run_teacher_search(msg.chat.id, group)
+    if get_state(chat_id) == 'teacher':
+        clear_state(chat_id)
+        run_teacher_search(chat_id, group)
         return
-    save_group(msg.chat.id, group)
+    if not looks_like_group(group):
+        send_fresh(
+            chat_id,
+            f"🤔 «{group}» не похоже на название группы.\n\n"
+            f"Напиши её номером, например СД-21 или исип41,\n"
+            f"либо выбери из списка:",
+            reply_markup=pick_button(),
+        )
+        return
+    save_group(chat_id, group)
     send_fresh(
-        msg.chat.id,
+        chat_id,
         f"✅ Группа сохранена: {group}\n\nВыбери, что показать:",
         reply_markup=main_menu(group),
     )
@@ -928,106 +1042,142 @@ def build_schedule_text(group, target_date, label):
 
 
 def handle_callback(call):
-    chat_id = call.message.chat.id
-    message_id = call.message.message_id
-    data = call.data or ''
-
     try:
         bot.answer_callback_query(call.id)
     except Exception as e:
         print(f"=== answer_callback_query ERROR === {e}", flush=True)
 
+    # FIX: у апдейтов из inline-режима может не быть message — раньше падало
+    if not call.message or not call.message.chat:
+        print("=== handle_callback === нет call.message, игнорирую", flush=True)
+        return
+
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    data = call.data or ''
+
     def show(text, markup=None):
-        new_id = send_or_edit(chat_id, message_id, text, markup)
-        set_last_msg(chat_id, new_id)
-        return new_id
+        try:
+            ids = list(get_last_msg(chat_id))  # FIX: копия, чтобы не мутировать кэш
+            if message_id not in ids:
+                ids.append(message_id)
+            if len(text) <= 4000 and safe_edit(chat_id, message_id, text, markup):
+                # FIX: подчищаем старые части длинных сообщений
+                for mid in ids:
+                    if mid != message_id:
+                        safe_delete(chat_id, mid)
+                new_ids = [message_id]
+            else:
+                for mid in ids:
+                    safe_delete(chat_id, mid)
+                new_ids = send_long(chat_id, text, markup)
+            set_last_msg(chat_id, new_ids)
+            return new_ids[-1] if new_ids else None
+        except Exception as e:
+            print(f"=== show ERROR === {e}", flush=True)
+            return None
+
+    def progress(text):
+        # временное «⏳...» — редактирует нажатое сообщение, не трогая трекинг
+        safe_edit(chat_id, message_id, text, None)
 
     if data == 'noop':
         return
 
-    # --- выбор группы ---
-    if data == 'change_group':
-        clear_state(chat_id)
-        show(GROUP_PROMPT, pick_button())
-        return
-
-    if data == 'pick':
-        clear_state(chat_id)
-        send_or_edit(chat_id, message_id, "⏳ Загружаю список групп...", None)
-        by_campus, _ = collect_groups()
-        if not by_campus:
-            show("😔 Не удалось получить список групп. Напиши группу вручную "
-                 "(например, СД-21).", pick_button())
-            return
-        show("🏫 Выбери корпус:", campus_menu(by_campus))
-        return
-
-    if data.startswith('cp|'):
-        parts = data.split('|')
-        key = parts[1] if len(parts) > 1 else ''
-        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-        by_campus, _ = collect_groups()
-        campus = next((c for c in by_campus if campus_key(c) == key), None)
-        if not campus:
-            show("Список изменился, выбери корпус заново:", campus_menu(by_campus))
-            return
-        show(f"🏫 {campus}\nВыбери группу:", groups_menu(by_campus[campus], key, page))
-        return
-
-    if data.startswith('pg|'):
-        group = data.split('|', 1)[1]
-        save_group(chat_id, group)
-        show(f"✅ Группа выбрана: {group}\n\nВыбери, что показать:", main_menu(group))
-        return
-
-    # --- преподаватель ---
-    if data == 'tsearch':
-        set_state(chat_id, 'teacher')
-        show(TEACHER_PROMPT, teacher_prompt_menu())
-        return
-
-    if data == 'home':
-        clear_state(chat_id)
-        group = get_saved_group(chat_id)
-        if group:
-            show("Выбери, что показать:", main_menu(group))
-        else:
+    try:  # FIX: сетевые ошибки больше не оставляют юзера навсегда с «⏳»
+        # --- выбор группы ---
+        if data == 'change_group':
+            clear_state(chat_id)
             show(GROUP_PROMPT, pick_button())
-        return
-
-    if data.startswith('td|'):
-        parts = data.split('|', 2)
-        labels = {'-1': 'вчера', '0': 'сегодня', '1': 'завтра'}
-        if len(parts) < 3 or parts[1] not in labels:
             return
-        query = parts[2]
-        target = today_local() + dt.timedelta(days=int(parts[1]))
-        send_or_edit(chat_id, message_id, f"⏳ Ищу «{query}» на {labels[parts[1]]}...", None)
-        show(build_teacher_text(query, target, labels[parts[1]]), teacher_menu(query))
-        return
 
-    # --- расписание ---
-    if '|' not in data:
-        return
+        if data == 'pick':
+            clear_state(chat_id)
+            progress("⏳ Загружаю список групп...")
+            by_campus, _ = collect_groups()
+            if not by_campus:
+                show("😔 Не удалось получить список групп. Напиши группу вручную "
+                     "(например, СД-21).", pick_button())
+                return
+            show("🏫 Выбери корпус:", campus_menu(by_campus))
+            return
 
-    action, group = data.split('|', 1)
-    today = today_local()
+        if data.startswith('cp|'):
+            parts = data.split('|')
+            key = parts[1] if len(parts) > 1 else ''
+            page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            by_campus, _ = collect_groups()
+            campus = next((c for c in by_campus if campus_key(c) == key), None)
+            if not campus:
+                show("Список изменился, выбери корпус заново:", campus_menu(by_campus))
+                return
+            show(f"🏫 {campus}\nВыбери группу:", groups_menu(by_campus[campus], key, page))
+            return
 
-    if action == 'today':
-        target, label = today, 'сегодня'
-    elif action == 'yesterday':
-        target, label = today - dt.timedelta(days=1), 'вчера'
-    elif action == 'tomorrow':
-        target, label = today + dt.timedelta(days=1), 'завтра'
-    else:
-        return
+        if data.startswith('pg|'):
+            group = data.split('|', 1)[1]
+            save_group(chat_id, group)
+            show(f"✅ Группа выбрана: {group}\n\nВыбери, что показать:", main_menu(group))
+            return
 
-    send_or_edit(chat_id, message_id, f"⏳ Загружаю расписание на {label}...", None)
-    text = build_schedule_text(group, target, label)
-    show(text, main_menu(group))
+        # --- преподаватель ---
+        if data == 'tsearch':
+            set_state(chat_id, 'teacher')
+            show(TEACHER_PROMPT, teacher_prompt_menu())
+            return
+
+        if data == 'home':
+            clear_state(chat_id)
+            group = get_saved_group(chat_id)
+            if group:
+                show("Выбери, что показать:", main_menu(group))
+            else:
+                show(GROUP_PROMPT, pick_button())
+            return
+
+        if data.startswith('td|'):
+            parts = data.split('|', 2)
+            labels = {'-1': 'вчера', '0': 'сегодня', '1': 'завтра'}
+            if len(parts) < 3 or parts[1] not in labels:
+                return
+            query = parts[2]
+            target = today_local() + dt.timedelta(days=int(parts[1]))
+            progress(f"⏳ Ищу «{query}» на {labels[parts[1]]}...")
+            show(build_teacher_text(query, target, labels[parts[1]]), teacher_menu(query))
+            return
+
+        # --- расписание ---
+        if '|' not in data:
+            return
+
+        action, group = data.split('|', 1)
+        today = today_local()
+
+        if action == 'today':
+            target, label = today, 'сегодня'
+        elif action == 'yesterday':
+            target, label = today - dt.timedelta(days=1), 'вчера'
+        elif action == 'tomorrow':
+            target, label = today + dt.timedelta(days=1), 'завтра'
+        else:
+            return
+
+        progress(f"⏳ Загружаю расписание на {label}...")
+        text = build_schedule_text(group, target, label)
+        show(text, main_menu(group))
+
+    except Exception as e:
+        print(f"=== CALLBACK ERROR === {data}: {e}", flush=True)
+        traceback.print_exc()
+        show("😔 Не удалось загрузить данные. Попробуй ещё раз через минуту.", None)
 
 
 # --- WEBHOOK ---
+
+def _debug_ok():
+    """DEBUG_KEY задан → /debug требует ?key=...; не задан → открыты как раньше."""
+    return (not DEBUG_KEY) or request.args.get('key') == DEBUG_KEY
+
 
 @app.route('/', methods=['GET'])
 def index():
@@ -1036,6 +1186,8 @@ def index():
 
 @app.route('/debug', methods=['GET'])
 def debug_links():
+    if not _debug_ok():
+        return jsonify({'error': 'unauthorized'}), 403
     links = extract_sheet_links()
     by_date = {}
     for l in links:
@@ -1054,6 +1206,8 @@ def debug_links():
 
 @app.route('/debug/redis', methods=['GET'])
 def debug_redis():
+    if not _debug_ok():
+        return jsonify({'error': 'unauthorized'}), 403
     out = {'enabled': redis is not None}
     if redis:
         key = ckey('debug', 'ping')
@@ -1064,6 +1218,8 @@ def debug_redis():
 
 @app.route('/debug/day/<date_str>', methods=['GET'])
 def debug_day(date_str):
+    if not _debug_ok():
+        return jsonify({'error': 'unauthorized'}), 403
     try:
         target = dt.datetime.strptime(date_str, '%Y-%m-%d').date()
     except ValueError:
@@ -1100,6 +1256,8 @@ def debug_day(date_str):
 
 @app.route('/debug/teachers/<date_str>', methods=['GET'])
 def debug_teachers(date_str):
+    if not _debug_ok():
+        return jsonify({'error': 'unauthorized'}), 403
     try:
         target = dt.datetime.strptime(date_str, '%Y-%m-%d').date()
     except ValueError:
@@ -1124,23 +1282,48 @@ def debug_teachers(date_str):
 
 @app.route('/', methods=['POST'])
 def webhook():
+    # FIX: проверка секрета (если WEBHOOK_SECRET задан)
+    if WEBHOOK_SECRET and request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
+        return '', 403
     try:
         raw = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(raw)
+        if update is None:
+            return '', 200
+
+        # FIX: дедупликация — если обработка шла дольше таймаута Telegram,
+        # тот же апдейт мог прийти повторно
+        uid = getattr(update, 'update_id', None)
+        if uid is not None:
+            if uid in seen_updates:
+                print(f"=== WEBHOOK === дубль update {uid}, пропуск", flush=True)
+                return '', 200
+            seen_updates[uid] = True
 
         if update.message:
             msg = update.message
             text = (msg.text or '').strip()
             print(f"=== WEBHOOK === message: {text[:60]}", flush=True)
             cmd = text.split()[0].split('@')[0].lower() if text.startswith('/') else ''
-            if cmd == '/start':
-                start_message(msg)
-            elif cmd == '/group':
-                group_command(msg)
-            elif cmd == '/teacher':
-                teacher_command(msg, text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else '')
-            else:
-                handle_group_input(msg)
+            try:  # FIX: юзер получит сообщение об ошибке, а не тишину
+                if cmd == '/start':
+                    start_message(msg)
+                elif cmd == '/group':
+                    group_command(msg)
+                elif cmd == '/teacher':
+                    teacher_command(msg, text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else '')
+                else:
+                    handle_group_input(msg)
+            except Exception as e:
+                print(f"=== MESSAGE HANDLER ERROR === {e}", flush=True)
+                traceback.print_exc()
+                try:
+                    g = get_saved_group(msg.chat.id)
+                    send_fresh(msg.chat.id,
+                               "😔 Произошла ошибка при загрузке данных. Попробуй ещё раз.",
+                               main_menu(g) if g else pick_button())
+                except Exception as e2:
+                    print(f"=== error message failed === {e2}", flush=True)
 
         elif update.callback_query:
             print(f"=== WEBHOOK === callback: {update.callback_query.data}", flush=True)
