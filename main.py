@@ -27,10 +27,12 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения.")
 
+BUILD = '2026-09-24-html-cards'  # метка версии: видна на GET / и в логах при старте
+
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
 DEBUG_KEY = os.getenv('DEBUG_KEY')
 
-print(f"=== BOOT === Токен загружен | webhook_secret: {'да' if WEBHOOK_SECRET else 'нет'}"
+print(f"=== BOOT === build {BUILD} | Токен загружен | webhook_secret: {'да' if WEBHOOK_SECRET else 'нет'}"
       f" | debug_key: {'да' if DEBUG_KEY else 'нет'}", flush=True)
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -1488,7 +1490,7 @@ def _debug_ok():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "Telegram bot is running.", 200
+    return f"Telegram bot is running. build={BUILD}", 200
 
 
 @app.route('/debug', methods=['GET'])
